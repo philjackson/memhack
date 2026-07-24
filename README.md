@@ -8,6 +8,10 @@ then write new values back.
 It's the classic tool for inspecting and modifying a running program's state —
 for debugging, reverse-engineering, or editing game values in a process you own.
 
+![Scanning a process and narrowing the matches](docs/scanner.png)
+
+![Picking a process to attach to](docs/picker.png)
+
 ## Building
 
 ```sh
@@ -50,6 +54,10 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
 - **Type a scan expression** in the `scan›` line and press **Enter** to scan
   (first scan finds all matches; later scans narrow them). The same expressions
   as the CLI work: `1337`, `> 100`, `10..20`, `changed`, `inc`, `dec 5`, …
+- **Enter on an empty input repeats the last scan** — hold it down to keep
+  narrowing (e.g. `inc`/`changed`) as a value keeps changing.
+- **Esc cancels a scan in progress** (a full-memory first scan can take a
+  while); the match set is left untouched.
 - The **matches table** shows current values, refreshed live a few times a second.
 - **Tab** switches focus between the input and the table. With the table focused,
   **↑/↓** select a row and **w** (or **Enter**) edits its value in place.
