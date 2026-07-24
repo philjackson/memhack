@@ -1,10 +1,16 @@
 package scan
 
 import (
+	"context"
+	"errors"
 	"fmt"
 
 	"github.com/phil/memhack/internal/memory"
 )
+
+// ErrCancelled is returned by ScanContext when the scan is cancelled before it
+// completes. The match set is left unchanged, as if the scan never ran.
+var ErrCancelled = errors.New("scan cancelled")
 
 // Match is a single memory location that satisfied all scans so far, along
 // with the value most recently observed there (used for relative scans).
@@ -158,27 +164,34 @@ func (s *Scanner) pushHistory() {
 // chunkSize bounds how much we read from a region at once.
 const chunkSize = 1 << 20 // 1 MiB
 
-// Scan runs a scan with the given condition. The first scan sweeps all
-// scannable regions; subsequent scans narrow the existing match set. The
-// prior match set is saved first so the scan can be reverted with Undo.
-func (s *Scanner) Scan(c Cond) error {
+// Scan runs a scan with the given condition. It is equivalent to ScanContext
+// with a background (never-cancelled) context.
+func (s *Scanner) Scan(c Cond) error { return s.ScanContext(context.Background(), c) }
+
+// ScanContext runs a scan that aborts if ctx is cancelled. The first scan
+// sweeps all scannable regions; subsequent scans narrow the existing match
+// set. The prior match set is saved first so the scan can be reverted with
+// Undo. On cancellation it returns ErrCancelled and leaves the match set
+// unchanged.
+func (s *Scanner) ScanContext(ctx context.Context, c Cond) error {
 	s.pushHistory()
 	var err error
 	if s.scanned {
-		err = s.narrow(c)
+		err = s.narrow(ctx, c)
 	} else {
-		err = s.first(c)
+		err = s.first(ctx, c)
 	}
 	if err != nil {
-		// The scan didn't happen; drop the snapshot we just pushed so it
-		// doesn't count as an undo step.
+		// The scan didn't complete; drop the snapshot we just pushed so it
+		// doesn't count as an undo step. first/narrow only publish their
+		// results on success, so s.Matches is untouched on error.
 		s.history = s.history[:len(s.history)-1]
 	}
 	return err
 }
 
 // first performs the initial full-memory sweep.
-func (s *Scanner) first(c Cond) error {
+func (s *Scanner) first(ctx context.Context, c Cond) error {
 	if c.Op.needsPrev() {
 		return fmt.Errorf("relative scan (changed/increased/...) needs a prior scan")
 	}
@@ -199,6 +212,9 @@ func (s *Scanner) first(c Cond) error {
 			continue
 		}
 		for addr := r.Start; addr < r.End; {
+			if ctx.Err() != nil {
+				return ErrCancelled
+			}
 			n := chunkSize
 			if remain := r.End - addr; uint64(n) > remain {
 				n = int(remain)
@@ -231,7 +247,7 @@ func (s *Scanner) first(c Cond) error {
 }
 
 // narrow re-reads each existing match and keeps those still satisfying c.
-func (s *Scanner) narrow(c Cond) error {
+func (s *Scanner) narrow(ctx context.Context, c Cond) error {
 	if err := s.proc.Freeze(); err != nil {
 		return err
 	}
@@ -242,7 +258,12 @@ func (s *Scanner) narrow(c Cond) error {
 	// is retained in the undo history and must not be overwritten.
 	var kept []Match
 
-	for _, m := range s.Matches {
+	for i, m := range s.Matches {
+		// Check for cancellation periodically (not every iteration, to keep
+		// the hot loop tight).
+		if i%4096 == 0 && ctx.Err() != nil {
+			return ErrCancelled
+		}
 		got, err := s.proc.ReadAt(buf, m.Addr)
 		if err != nil || got < size {
 			continue

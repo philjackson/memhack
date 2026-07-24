@@ -66,6 +66,7 @@ type model struct {
 	busy       bool
 	status     string
 	errMsg     string
+	lastScan   string // last scan expression, for instant repeat
 
 	width, height int
 	startup       tea.Cmd
@@ -218,6 +219,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		if m.mode == modeWrite {
 			m.cancelWrite()
+			return m, nil
+		}
+		// Cancel an in-progress scan.
+		if m.busy && m.ctrl.ScanRunning() {
+			m.ctrl.CancelScan()
+			m.status = "cancelling scan…"
 		}
 		return m, nil
 	}
@@ -259,6 +266,12 @@ func (m model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "enter" {
 		v := strings.TrimSpace(m.input.Value())
 		if v == "" {
+			// Instant repeat: re-run the last scan without retyping it. Handy
+			// for narrowing (inc/dec/changed) as a value keeps changing.
+			if m.mode == modeScan && m.lastScan != "" {
+				m.status = "repeat: " + m.lastScan
+				return m.issue(m.ctrl.scanExpr(m.lastScan))
+			}
 			return m, nil
 		}
 		if m.mode == modeWrite {
@@ -274,6 +287,7 @@ func (m model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "quit", "exit", "q":
 			return m, tea.Quit
 		}
+		m.lastScan = v
 		return m.issue(m.ctrl.scanExpr(v))
 	}
 	var cmd tea.Cmd
@@ -518,10 +532,14 @@ func (m model) matchFooter() string {
 
 func (m model) helpText() string {
 	switch {
+	case m.busy && m.ctrl.ScanRunning():
+		return "scanning… • esc: cancel"
 	case m.focusTable:
 		return "↑/↓ select • w/enter edit value • tab: input • ctrl+z undo • ctrl+r reset • ctrl+c quit"
 	case m.mode == modeWrite:
 		return "enter: write value • esc: cancel • tab: matches"
+	case m.lastScan != "":
+		return "enter to scan • empty enter: repeat “" + m.lastScan + "” • tab: matches • ctrl+z undo • quit/ctrl+c/ctrl+d"
 	default:
 		return "value/comparison + enter to scan • :pid :run :type :set :setall • tab: matches • ctrl+z undo • quit / ctrl+c / ctrl+d to exit"
 	}

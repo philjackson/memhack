@@ -115,6 +115,74 @@ func TestStatusShowsWorkingWhenBusy(t *testing.T) {
 	}
 }
 
+func TestRepeatLastScanOnEmptyEnter(t *testing.T) {
+	m := newTestModel()
+	// Empty enter with no prior scan does nothing.
+	nm, cmd := m.Update(press("enter"))
+	m = nm.(model)
+	if cmd != nil {
+		t.Error("empty enter with no prior scan should do nothing")
+	}
+
+	// Run a scan; it should be remembered.
+	m = typeString(m, "inc")
+	nm, _ = m.Update(press("enter"))
+	m = nm.(model)
+	if m.lastScan != "inc" {
+		t.Fatalf("lastScan = %q, want \"inc\"", m.lastScan)
+	}
+
+	// Clear busy (as the stateMsg would) and press empty enter to repeat.
+	m.busy = false
+	nm, cmd = m.Update(press("enter"))
+	m = nm.(model)
+	if cmd == nil {
+		t.Error("empty enter after a scan should repeat it")
+	}
+	if !strings.Contains(m.status, "repeat") || !strings.Contains(m.status, "inc") {
+		t.Errorf("status = %q, want a repeat message naming the scan", m.status)
+	}
+}
+
+func TestCommandNotRememberedAsLastScan(t *testing.T) {
+	m := newTestModel()
+	m = typeString(m, ":reset")
+	nm, _ := m.Update(press("enter"))
+	m = nm.(model)
+	if m.lastScan != "" {
+		t.Errorf("a ':' command should not be recorded as a repeatable scan; got %q", m.lastScan)
+	}
+}
+
+func TestEscCancelsRunningScan(t *testing.T) {
+	m := newTestModel()
+	cancelled := false
+	// Simulate a scan in progress by installing a cancel func.
+	m.ctrl.mu.Lock()
+	m.ctrl.scanCancel = func() { cancelled = true }
+	m.ctrl.mu.Unlock()
+	m.busy = true
+
+	nm, _ := m.Update(press("esc"))
+	m = nm.(model)
+	if !cancelled {
+		t.Error("esc while a scan is running should cancel it")
+	}
+	if !strings.Contains(m.status, "cancel") {
+		t.Errorf("status = %q, want a cancelling message", m.status)
+	}
+}
+
+func TestEscDoesNothingWhenIdle(t *testing.T) {
+	m := newTestModel()
+	// No scan running, not busy: esc should be a harmless no-op.
+	nm, cmd := m.Update(press("esc"))
+	m = nm.(model)
+	if cmd != nil {
+		t.Error("esc while idle should not issue a command")
+	}
+}
+
 func TestTabTogglesFocus(t *testing.T) {
 	m := newTestModel()
 	if m.focusTable {

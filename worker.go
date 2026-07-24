@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -68,6 +70,13 @@ type worker struct {
 // tea.Cmds that submit a job and deliver the resulting state as a stateMsg.
 type controller struct {
 	jobs chan job
+
+	// scanCancel cancels the scan currently running (if any). It is set when a
+	// scan starts and cleared when it finishes; guarded by mu because it is
+	// read/written from both the UI goroutine (CancelScan) and the tea.Cmd
+	// goroutine that runs the scan.
+	mu         sync.Mutex
+	scanCancel context.CancelFunc
 }
 
 // newController starts the worker goroutine and returns a controller for it.
@@ -75,6 +84,23 @@ func newController(initial scan.DataType) *controller {
 	w := &worker{jobs: make(chan job), dt: initial}
 	go w.loop()
 	return &controller{jobs: w.jobs}
+}
+
+// CancelScan aborts the scan in progress, if one is running.
+func (c *controller) CancelScan() {
+	c.mu.Lock()
+	cancel := c.scanCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// ScanRunning reports whether a cancellable scan is currently in flight.
+func (c *controller) ScanRunning() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.scanCancel != nil
 }
 
 func (w *worker) loop() {
@@ -135,7 +161,23 @@ func (c *controller) launch(argv []string) tea.Cmd {
 }
 
 func (c *controller) scanExpr(expr string) tea.Cmd {
-	return c.submit(func(w *worker) (string, error) { return w.scanExpr(expr) })
+	return func() tea.Msg {
+		ctx, cancel := context.WithCancel(context.Background())
+		c.mu.Lock()
+		c.scanCancel = cancel
+		c.mu.Unlock()
+
+		reply := make(chan state, 1)
+		c.jobs <- job{run: func(w *worker) (string, error) { return w.scanExpr(ctx, expr) }, reply: reply}
+		st := <-reply
+
+		c.mu.Lock()
+		c.scanCancel = nil
+		c.mu.Unlock()
+		cancel() // release context resources
+
+		return stateMsg(st)
+	}
 }
 
 func (c *controller) refresh() tea.Cmd {
@@ -201,7 +243,7 @@ func (w *worker) detach() {
 	w.sc = nil
 }
 
-func (w *worker) scanExpr(expr string) (string, error) {
+func (w *worker) scanExpr(ctx context.Context, expr string) (string, error) {
 	if w.sc == nil {
 		return "", errNotAttached
 	}
@@ -211,7 +253,11 @@ func (w *worker) scanExpr(expr string) (string, error) {
 	}
 	first := !w.sc.Scanned()
 	before := len(w.sc.Matches)
-	if err := w.sc.Scan(cond); err != nil {
+	if err := w.sc.ScanContext(ctx, cond); err != nil {
+		if errors.Is(err, scan.ErrCancelled) {
+			// Report as a note, not an error; the match set is unchanged.
+			return "scan cancelled", nil
+		}
 		return "", err
 	}
 	if first {

@@ -1,6 +1,8 @@
 package scan
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,6 +138,56 @@ func TestScanWriteRoundTrip(t *testing.T) {
 	}
 	if len(s.Matches) != firstCount {
 		t.Errorf("after undo: %d matches, want %d (the first-scan result)", len(s.Matches), firstCount)
+	}
+}
+
+func TestScanCancel(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	bin := buildTarget(t)
+	proc, err := memory.Launch(bin)
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied") {
+			t.Skipf("ptrace not permitted here: %v", err)
+		}
+		t.Fatalf("launch: %v", err)
+	}
+	defer func() {
+		proc.Close()
+		if p, err := os.FindProcess(proc.Pid); err == nil {
+			_ = p.Kill()
+			_, _ = p.Wait()
+		}
+	}()
+
+	s := NewScanner(proc, I32)
+
+	// A context cancelled before the scan starts must abort it immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = s.ScanContext(ctx, Cond{Op: Equal, Value: 1337})
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("ScanContext = %v, want ErrCancelled", err)
+	}
+	// A cancelled scan must leave the scanner exactly as it was.
+	if s.Scanned() {
+		t.Error("cancelled first scan should leave the scanner unscanned")
+	}
+	if len(s.Matches) != 0 {
+		t.Errorf("cancelled scan left %d matches, want 0", len(s.Matches))
+	}
+	if s.CanUndo() {
+		t.Error("cancelled scan should not add an undo step")
+	}
+
+	// A normal scan still works afterward.
+	if err := s.Scan(Cond{Op: Equal, Value: 1337}); err != nil {
+		t.Fatalf("scan after cancel: %v", err)
+	}
+	if len(s.Matches) == 0 {
+		t.Error("expected matches from the completed scan")
 	}
 }
 
