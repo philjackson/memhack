@@ -26,7 +26,7 @@ func assertQuit(t *testing.T, cmd tea.Cmd) {
 // run the returned tea.Cmds, so no worker interaction happens.
 func newTestModel() model {
 	ctrl := &controller{jobs: make(chan job)}
-	m := newModel(ctrl, scan.I32, nil, screenScanner)
+	m := newModel(ctrl, scan.I32, nil, screenScanner, 0)
 	// Give it a size so the table/input are laid out.
 	m2, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	return m2.(model)
@@ -151,6 +151,52 @@ func TestCommandNotRememberedAsLastScan(t *testing.T) {
 	m = nm.(model)
 	if m.lastScan != "" {
 		t.Errorf("a ':' command should not be recorded as a repeatable scan; got %q", m.lastScan)
+	}
+}
+
+func TestWatchPauseToggle(t *testing.T) {
+	m := newTestModel()
+	if m.watchPaused {
+		t.Fatal("watch should start active")
+	}
+	nm, _ := m.Update(press("ctrl+p"))
+	m = nm.(model)
+	if !m.watchPaused {
+		t.Error("ctrl+p should pause the watch")
+	}
+	if !strings.Contains(m.status, "paused") {
+		t.Errorf("status = %q, want a paused message", m.status)
+	}
+	nm, _ = m.Update(press("ctrl+p"))
+	m = nm.(model)
+	if m.watchPaused {
+		t.Error("ctrl+p again should resume the watch")
+	}
+}
+
+func TestTickSkipsRefreshWhenPaused(t *testing.T) {
+	m := newTestModel()
+	m.st = state{Attached: true, Count: 2, Scanned: true, Type: scan.I32}
+	m.watchPaused = true
+	nm, cmd := m.Update(tickMsg{})
+	m = nm.(model)
+	if m.busy {
+		t.Error("a paused watch must not start a refresh on tick")
+	}
+	if cmd == nil {
+		t.Error("tick should still reschedule itself even while paused")
+	}
+}
+
+func TestPausedWatchShownInStatus(t *testing.T) {
+	m := newTestModel()
+	m.st = state{Attached: true, Pid: 1, Type: scan.I32}
+	if !strings.Contains(m.View(), "watch") {
+		t.Error("status should show the watch state")
+	}
+	m.watchPaused = true
+	if !strings.Contains(m.View(), "watch paused") {
+		t.Error("status should show 'watch paused' when paused")
 	}
 }
 

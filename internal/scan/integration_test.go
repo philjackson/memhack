@@ -191,6 +191,56 @@ func TestScanCancel(t *testing.T) {
 	}
 }
 
+func TestDetachedBetweenOperations(t *testing.T) {
+	// The core of the idle-freeze fix: the target must never be left attached
+	// (ptrace-stopped) between operations.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	bin := buildTarget(t)
+	proc, err := memory.Launch(bin)
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied") {
+			t.Skipf("ptrace not permitted here: %v", err)
+		}
+		t.Fatalf("launch: %v", err)
+	}
+	defer func() {
+		proc.Close()
+		if p, err := os.FindProcess(proc.Pid); err == nil {
+			_ = p.Kill()
+			_, _ = p.Wait()
+		}
+	}()
+
+	if proc.Attached() {
+		t.Error("process should not be attached immediately after launch")
+	}
+
+	s := NewScanner(proc, I32)
+	if err := s.Scan(Cond{Op: Equal, Value: 1337}); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if proc.Attached() {
+		t.Error("process should be detached after a scan completes")
+	}
+
+	s.Refresh()
+	if proc.Attached() {
+		t.Error("process should be detached after a refresh")
+	}
+
+	if len(s.Matches) > 0 {
+		raw, _ := I32.Encode("42")
+		if err := s.Write(s.Matches[0], raw); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if proc.Attached() {
+			t.Error("process should be detached after a write")
+		}
+	}
+}
+
 func TestRelativeScanNeedsPrior(t *testing.T) {
 	// A relative scan as the very first scan is an error; verify without
 	// needing a live process by driving a scanner whose proc is never used.

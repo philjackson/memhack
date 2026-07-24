@@ -28,6 +28,7 @@ func main() {
 	pidFlag := flag.Int("pid", 0, "attach to this process id on startup")
 	execFlag := flag.String("exec", "", "launch this program as a child and attach to it")
 	typeFlag := flag.String("type", "i32", "initial data type (i8/i16/i32/i64/u8..u64/f32/f64)")
+	watchFlag := flag.Duration("watch", defaultWatchInterval, "live-watch refresh interval in the TUI (e.g. 500ms, 2s)")
 	replFlag := flag.Bool("repl", false, "use the line-based REPL instead of the TUI")
 	flag.Parse()
 
@@ -41,7 +42,7 @@ func main() {
 		runREPL(dt, *pidFlag, *execFlag, flag.Args())
 		return
 	}
-	if err := runTUI(dt, *pidFlag, *execFlag, flag.Args()); err != nil {
+	if err := runTUI(dt, *pidFlag, *execFlag, flag.Args(), *watchFlag); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -71,7 +72,7 @@ func runREPL(dt scan.DataType, pid int, exec string, args []string) {
 
 // runTUI runs the Bubble Tea interface. ptrace work happens on the worker's
 // own locked thread (see worker.loop), so the UI goroutine stays free.
-func runTUI(dt scan.DataType, pid int, exec string, args []string) error {
+func runTUI(dt scan.DataType, pid int, exec string, args []string, watch time.Duration) error {
 	ctrl := newController(dt)
 
 	var startup tea.Cmd
@@ -86,7 +87,7 @@ func runTUI(dt scan.DataType, pid int, exec string, args []string) error {
 		start = screenPicker
 	}
 
-	prog := tea.NewProgram(newModel(ctrl, dt, startup, start), tea.WithAltScreen())
+	prog := tea.NewProgram(newModel(ctrl, dt, startup, start, watch), tea.WithAltScreen())
 	_, err := prog.Run()
 	return err
 }

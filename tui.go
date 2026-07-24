@@ -17,8 +17,12 @@ import (
 )
 
 const (
-	refreshInterval = 500 * time.Millisecond
-	scanPrompt      = "scan› "
+	// defaultWatchInterval is how often the live watch re-reads values. Each
+	// tick attaches, reads, and detaches, so the target is only briefly
+	// stopped per tick and runs freely in between; a modest interval keeps it
+	// unintrusive (especially for large, multithreaded targets).
+	defaultWatchInterval = 1 * time.Second
+	scanPrompt           = "scan› "
 )
 
 // inputMode selects how the text input's contents are interpreted on Enter.
@@ -68,11 +72,17 @@ type model struct {
 	errMsg     string
 	lastScan   string // last scan expression, for instant repeat
 
+	watchInterval time.Duration
+	watchPaused   bool
+
 	width, height int
 	startup       tea.Cmd
 }
 
-func newModel(ctrl *controller, dt scan.DataType, startup tea.Cmd, start screen) model {
+func newModel(ctrl *controller, dt scan.DataType, startup tea.Cmd, start screen, watch time.Duration) model {
+	if watch <= 0 {
+		watch = defaultWatchInterval
+	}
 	ti := textinput.New()
 	ti.Prompt = scanPrompt
 	ti.Placeholder = "e.g. 1337, > 100, 10..20, inc, :type f32"
@@ -95,24 +105,25 @@ func newModel(ctrl *controller, dt scan.DataType, startup tea.Cmd, start screen)
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 
 	return model{
-		ctrl:    ctrl,
-		input:   ti,
-		table:   tbl,
-		spin:    sp,
-		list:    newProcList(),
-		screen:  start,
-		mode:    modeScan,
-		st:      state{Type: dt},
-		startup: startup,
+		ctrl:          ctrl,
+		input:         ti,
+		table:         tbl,
+		spin:          sp,
+		list:          newProcList(),
+		screen:        start,
+		mode:          modeScan,
+		st:            state{Type: dt},
+		startup:       startup,
+		watchInterval: watch,
 	}
 }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
+func tickCmd(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m model) Init() tea.Cmd {
-	cmds := []tea.Cmd{textinput.Blink, tickCmd()}
+	cmds := []tea.Cmd{textinput.Blink, tickCmd(m.watchInterval)}
 	if m.startup != nil {
 		cmds = append(cmds, m.startup)
 	}
@@ -138,10 +149,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.setProcs(msg.procs)
 
 	case tickMsg:
-		cmds := []tea.Cmd{tickCmd()}
-		// Only auto-refresh when idle, so ticks don't pile up behind a slow
-		// scan on the single worker.
-		if !m.busy && m.st.Attached && m.st.Count > 0 {
+		cmds := []tea.Cmd{tickCmd(m.watchInterval)}
+		// Auto-refresh only when the watch is running, we're idle, and there
+		// are matches to read. Each refresh attaches, reads, and detaches, so
+		// while paused (or matchless) the target is never touched.
+		if !m.watchPaused && !m.busy && m.st.Attached && m.st.Count > 0 {
 			cmds = append(cmds, m.markBusy(), m.ctrl.refresh())
 		}
 		return m, tea.Batch(cmds...)
@@ -213,6 +225,14 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.issue(m.ctrl.undo())
 	case "ctrl+r":
 		return m.issue(m.ctrl.reset())
+	case "ctrl+p":
+		m.watchPaused = !m.watchPaused
+		if m.watchPaused {
+			m.status = "live watch paused"
+		} else {
+			m.status = "live watch resumed"
+		}
+		return m, nil
 	case "tab":
 		m.toggleFocus()
 		return m, nil
@@ -516,7 +536,11 @@ func (m model) statusLine() string {
 	if m.st.Scanned {
 		matches = fmt.Sprintf("%d matches", m.st.Count)
 	}
-	line := statusStyle.Render(fmt.Sprintf("%s │ type %s │ %s", target, m.st.Type, matches))
+	watch := fmt.Sprintf("watch %s", m.watchInterval)
+	if m.watchPaused {
+		watch = "watch paused"
+	}
+	line := statusStyle.Render(fmt.Sprintf("%s │ type %s │ %s │ %s", target, m.st.Type, matches, watch))
 	if m.busy {
 		line += "  " + m.spin.View() + statusStyle.Render(" working…")
 	}
@@ -539,8 +563,8 @@ func (m model) helpText() string {
 	case m.mode == modeWrite:
 		return "enter: write value • esc: cancel • tab: matches"
 	case m.lastScan != "":
-		return "enter to scan • empty enter: repeat “" + m.lastScan + "” • tab: matches • ctrl+z undo • quit/ctrl+c/ctrl+d"
+		return "enter to scan • empty enter: repeat “" + m.lastScan + "” • ctrl+p: pause watch • tab: matches • quit/ctrl+c/ctrl+d"
 	default:
-		return "value/comparison + enter to scan • :pid :run :type :set :setall • tab: matches • ctrl+z undo • quit / ctrl+c / ctrl+d to exit"
+		return "value/comparison + enter to scan • :pid :run :type :set • ctrl+p: pause watch • tab: matches • ctrl+z undo • quit/ctrl+c/ctrl+d"
 	}
 }

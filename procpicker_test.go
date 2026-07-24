@@ -15,7 +15,7 @@ import (
 func newPickerModel(t *testing.T) model {
 	t.Helper()
 	ctrl := &controller{jobs: make(chan job)}
-	m := newModel(ctrl, scan.I32, nil, screenPicker)
+	m := newModel(ctrl, scan.I32, nil, screenPicker, 0)
 	m2, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = m2.(model)
 	m3, _ := m.Update(procListMsg{procs: []memory.ProcInfo{

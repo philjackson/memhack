@@ -195,10 +195,10 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 	if c.Op.needsPrev() {
 		return fmt.Errorf("relative scan (changed/increased/...) needs a prior scan")
 	}
-	if err := s.proc.Freeze(); err != nil {
+	if err := s.proc.Attach(); err != nil {
 		return err
 	}
-	defer s.proc.Thaw()
+	defer s.proc.Detach()
 	regions, err := memory.ReadMaps(s.proc.Pid)
 	if err != nil {
 		return err
@@ -248,10 +248,10 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 
 // narrow re-reads each existing match and keeps those still satisfying c.
 func (s *Scanner) narrow(ctx context.Context, c Cond) error {
-	if err := s.proc.Freeze(); err != nil {
+	if err := s.proc.Attach(); err != nil {
 		return err
 	}
-	defer s.proc.Thaw()
+	defer s.proc.Detach()
 	size := s.Type.Size()
 	buf := make([]byte, size)
 	// Build a fresh slice rather than filtering in place: the previous slice
@@ -298,10 +298,10 @@ func (s *Scanner) RefreshN(n int) {
 	if n <= 0 {
 		return
 	}
-	if err := s.proc.Freeze(); err != nil {
+	if err := s.proc.Attach(); err != nil {
 		return
 	}
-	defer s.proc.Thaw()
+	defer s.proc.Detach()
 	size := s.Type.Size()
 	buf := make([]byte, size)
 	for i := 0; i < n; i++ {
@@ -313,10 +313,10 @@ func (s *Scanner) RefreshN(n int) {
 
 // Write stores raw bytes at the given match's address.
 func (s *Scanner) Write(m Match, raw []byte) error {
-	if err := s.proc.Freeze(); err != nil {
+	if err := s.proc.Attach(); err != nil {
 		return err
 	}
-	defer s.proc.Thaw()
+	defer s.proc.Detach()
 	_, err := s.proc.WriteAt(raw, m.Addr)
 	return err
 }

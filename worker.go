@@ -216,6 +216,14 @@ func (w *worker) attach(pid int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Probe once so a permission problem surfaces now (keeping the picker on
+	// screen) rather than on the first scan. Leaves the target running.
+	if err := proc.Attach(); err != nil {
+		proc.Close()
+		return "", err
+	}
+	proc.Detach()
+
 	w.proc = proc
 	w.sc = scan.NewScanner(proc, w.dt)
 	return fmt.Sprintf("attached to pid %d", pid), nil
@@ -230,6 +238,12 @@ func (w *worker) launch(argv []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := proc.Attach(); err != nil {
+		proc.Close()
+		return "", err
+	}
+	proc.Detach()
+
 	w.proc = proc
 	w.sc = scan.NewScanner(proc, w.dt)
 	return fmt.Sprintf("launched %s as pid %d", argv[0], proc.Pid), nil

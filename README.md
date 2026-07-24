@@ -58,6 +58,10 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
   narrowing (e.g. `inc`/`changed`) as a value keeps changing.
 - **Esc cancels a scan in progress** (a full-memory first scan can take a
   while); the match set is left untouched.
+- **The values are watched live** at a configurable interval (`-watch`,
+  default 1s). Each tick briefly attaches, reads, and detaches, so the target
+  runs freely between ticks. **Ctrl+P pauses/resumes** the watch — while paused
+  (or before you have any matches) memhack never touches the target at all.
 - The **matches table** shows current values, refreshed live a few times a second.
 - **Tab** switches focus between the input and the table. With the table focused,
   **↑/↓** select a row and **w** (or **Enter**) edits its value in place.
@@ -116,9 +120,13 @@ back to the previous match set (up to 16 steps).
 
 - **`/proc/<pid>/maps`** is parsed to find readable+writable regions worth scanning.
 - **`/proc/<pid>/mem`** is read (with `pread`-style `ReadAt`) and written for the actual scanning and editing.
-- **`ptrace`** (`PTRACE_SEIZE`) attaches to the target. Before each scan or write the
-  process is briefly stopped (`PTRACE_INTERRUPT`) and then resumed (`PTRACE_CONT`),
-  so every access sees a consistent snapshot without freezing the program between commands.
+- **`ptrace` is attached only around each operation.** For a scan, write, or
+  watch tick, memhack seizes the target, interrupts it, reads/writes, and then
+  detaches — leaving it running completely untraced in between. This matters:
+  a process left ptrace-attached while idle can get parked in a signal-delivery
+  stop that only the tracer can clear, so a continuously-attached scanner
+  intermittently *freezes* signal-heavy targets (games under Wine/Proton are a
+  classic case). Attaching per-operation avoids that entirely.
 - The initial scan sweeps memory with 1-byte granularity (so unaligned values are
   found); later scans only re-check the surviving match addresses, which is why they're fast.
 - **Threading.** `ptrace` binds the tracer to a single OS thread, so all
