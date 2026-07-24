@@ -156,3 +156,7 @@ This is an early scaffold. Natural next steps:
 - Value "freezing" — a background loop that keeps rewriting an address.
 - Alignment option (align scans to the type width for speed).
 - Disassembly / pointer-map following.
+
+## License
+
+[MIT](LICENSE) © Phil Jackson
