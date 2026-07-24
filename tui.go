@@ -155,6 +155,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spin, cmd = m.spin.Update(msg)
 		return m, cmd
 
+	case refreshMsg:
+		// Live value refresh: update the data but keep the status/error line,
+		// so a prior action's message stays on screen instead of flashing away.
+		m.busy = false
+		m.st = state(msg)
+		m.refreshTable()
+		return m, nil
+
 	case stateMsg:
 		m.busy = false
 		m.st = state(msg)

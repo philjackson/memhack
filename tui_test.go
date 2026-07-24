@@ -283,6 +283,48 @@ func TestStateMsgError(t *testing.T) {
 	}
 }
 
+func TestErrorSurvivesRefresh(t *testing.T) {
+	// A user action's error must not be wiped by the next periodic value
+	// refresh (regression: the error used to flash and vanish within ~500ms).
+	m := newTestModel()
+	nm, _ := m.Update(stateMsg(state{Type: scan.I32, Err: errNotAttached}))
+	m = nm.(model)
+	if !strings.Contains(m.errMsg, "not attached") {
+		t.Fatalf("errMsg = %q, want the action error", m.errMsg)
+	}
+
+	// A refresh arrives (as happens twice a second while matches exist).
+	nm, _ = m.Update(refreshMsg(state{
+		Attached: true, Type: scan.I32, Count: 3, Scanned: true,
+		Rows: []matchRow{{Index: 0, Addr: 0x1000, Value: "5"}},
+	}))
+	m = nm.(model)
+	if !strings.Contains(m.errMsg, "not attached") {
+		t.Errorf("refresh cleared the error message: errMsg = %q", m.errMsg)
+	}
+	// The refresh should still have updated the live data.
+	if m.st.Count != 3 {
+		t.Errorf("refresh did not update live data: count = %d", m.st.Count)
+	}
+	if !m.st.Attached || m.busy {
+		t.Error("refresh should update attached state and clear busy")
+	}
+}
+
+func TestStatusNoteSurvivesRefresh(t *testing.T) {
+	m := newTestModel()
+	nm, _ := m.Update(stateMsg(state{Type: scan.I32, Note: "wrote 1000 to 3 matches (0 failed)"}))
+	m = nm.(model)
+	if !strings.Contains(m.status, "3 matches") {
+		t.Fatalf("status = %q", m.status)
+	}
+	nm, _ = m.Update(refreshMsg(state{Attached: true, Type: scan.I32, Count: 3, Scanned: true}))
+	m = nm.(model)
+	if !strings.Contains(m.status, "3 matches") {
+		t.Errorf("refresh cleared the status note: status = %q", m.status)
+	}
+}
+
 func TestTickGating(t *testing.T) {
 	m := newTestModel()
 	// Idle + attached + matches -> tick should schedule a refresh (busy set).

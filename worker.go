@@ -39,8 +39,14 @@ type state struct {
 	Err      error
 }
 
-// stateMsg carries a state snapshot into the Bubble Tea update loop.
+// stateMsg carries the result of a user-initiated action; its Note/Err update
+// the status line.
 type stateMsg state
+
+// refreshMsg carries a periodic value refresh. It updates the live data only,
+// leaving the status/error line untouched so a prior action's message stays
+// readable rather than being wiped by the next refresh tick.
+type refreshMsg state
 
 // job is a unit of work run on the worker's locked thread.
 type job struct {
@@ -133,7 +139,11 @@ func (c *controller) scanExpr(expr string) tea.Cmd {
 }
 
 func (c *controller) refresh() tea.Cmd {
-	return c.submit(func(*worker) (string, error) { return "", nil })
+	return func() tea.Msg {
+		reply := make(chan state, 1)
+		c.jobs <- job{run: func(*worker) (string, error) { return "", nil }, reply: reply}
+		return refreshMsg(<-reply)
+	}
 }
 
 func (c *controller) write(index int, value string) tea.Cmd {
