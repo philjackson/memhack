@@ -154,6 +154,73 @@ func TestCommandNotRememberedAsLastScan(t *testing.T) {
 	}
 }
 
+func TestCommandHistoryNavigation(t *testing.T) {
+	m := newTestModel()
+	// Submit three lines (a scan, a command, a scan).
+	for _, line := range []string{"1337", ":type i32", "> 5"} {
+		m = typeString(m, line)
+		nm, _ := m.Update(press("enter"))
+		m = nm.(model)
+		m.busy = false // clear as the stateMsg would
+	}
+	if len(m.history) != 3 {
+		t.Fatalf("history has %d entries, want 3", len(m.history))
+	}
+
+	// Up (and ctrl+k) walk backwards through history, newest first.
+	nm, _ := m.Update(press("up"))
+	m = nm.(model)
+	if m.input.Value() != "> 5" {
+		t.Errorf("after one up: input = %q, want \"> 5\"", m.input.Value())
+	}
+	nm, _ = m.Update(press("ctrl+k"))
+	m = nm.(model)
+	if m.input.Value() != ":type i32" {
+		t.Errorf("after up,ctrl+k: input = %q, want \":type i32\"", m.input.Value())
+	}
+	nm, _ = m.Update(press("up"))
+	m = nm.(model)
+	if m.input.Value() != "1337" {
+		t.Errorf("after three ups: input = %q, want \"1337\"", m.input.Value())
+	}
+	// Further up clamps at the oldest.
+	nm, _ = m.Update(press("up"))
+	m = nm.(model)
+	if m.input.Value() != "1337" {
+		t.Errorf("up past oldest should stay: input = %q", m.input.Value())
+	}
+
+	// Down (and ctrl+j) walk forward; stepping past the newest clears the line.
+	nm, _ = m.Update(press("down"))
+	m = nm.(model)
+	if m.input.Value() != ":type i32" {
+		t.Errorf("after down: input = %q, want \":type i32\"", m.input.Value())
+	}
+	nm, _ = m.Update(press("ctrl+j"))
+	m = nm.(model)
+	if m.input.Value() != "> 5" {
+		t.Errorf("after down,ctrl+j: input = %q, want \"> 5\"", m.input.Value())
+	}
+	nm, _ = m.Update(press("down"))
+	m = nm.(model)
+	if m.input.Value() != "" {
+		t.Errorf("down past newest should clear input, got %q", m.input.Value())
+	}
+}
+
+func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {
+	m := newTestModel()
+	for i := 0; i < 3; i++ {
+		m = typeString(m, "inc")
+		nm, _ := m.Update(press("enter"))
+		m = nm.(model)
+		m.busy = false
+	}
+	if len(m.history) != 1 {
+		t.Errorf("consecutive duplicate submissions should collapse: history = %v", m.history)
+	}
+}
+
 func TestWatchPauseToggle(t *testing.T) {
 	m := newTestModel()
 	if m.watchPaused {

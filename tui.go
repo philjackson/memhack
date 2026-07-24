@@ -70,7 +70,9 @@ type model struct {
 	busy       bool
 	status     string
 	errMsg     string
-	lastScan   string // last scan expression, for instant repeat
+	lastScan   string   // last scan expression, for instant repeat
+	history    []string // submitted scan expressions and commands, oldest first
+	histPos    int      // cursor into history; == len(history) means "fresh line"
 
 	watchInterval time.Duration
 	watchPaused   bool
@@ -283,7 +285,18 @@ func (m model) handleTableKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.String() == "enter" {
+	switch msg.String() {
+	case "up", "ctrl+k":
+		if m.mode == modeScan {
+			m.historyStep(-1)
+			return m, nil
+		}
+	case "down", "ctrl+j":
+		if m.mode == modeScan {
+			m.historyStep(+1)
+			return m, nil
+		}
+	case "enter":
 		v := strings.TrimSpace(m.input.Value())
 		if v == "" {
 			// Instant repeat: re-run the last scan without retyping it. Handy
@@ -299,6 +312,7 @@ func (m model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cancelWrite() // reset prompt/mode; the value is captured below
 			return m.issue(m.ctrl.write(idx, v))
 		}
+		m.addHistory(v)
 		m.input.Reset()
 		if strings.HasPrefix(v, ":") {
 			return m.command(strings.TrimSpace(v[1:]))
@@ -414,6 +428,42 @@ func (m model) issue(cmd tea.Cmd) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, tea.Batch(cmd, m.markBusy())
+}
+
+// maxInputHistory bounds how many entered lines are remembered.
+const maxInputHistory = 200
+
+// addHistory records a submitted line (scan expression or command) and resets
+// the browse cursor to the fresh-line position.
+func (m *model) addHistory(line string) {
+	if n := len(m.history); n == 0 || m.history[n-1] != line {
+		m.history = append(m.history, line)
+		if len(m.history) > maxInputHistory {
+			m.history = m.history[len(m.history)-maxInputHistory:]
+		}
+	}
+	m.histPos = len(m.history)
+}
+
+// historyStep moves through the entered-command history and loads the entry
+// into the input. dir < 0 goes older (up), dir > 0 goes newer (down); stepping
+// past the newest entry returns to an empty fresh line.
+func (m *model) historyStep(dir int) {
+	if len(m.history) == 0 {
+		return
+	}
+	pos := m.histPos + dir
+	if pos < 0 {
+		pos = 0
+	}
+	if pos >= len(m.history) {
+		m.histPos = len(m.history)
+		m.input.SetValue("")
+		return
+	}
+	m.histPos = pos
+	m.input.SetValue(m.history[pos])
+	m.input.CursorEnd()
 }
 
 // markBusy flips the busy flag and, on the idle→busy edge, returns the command
@@ -563,8 +613,8 @@ func (m model) helpText() string {
 	case m.mode == modeWrite:
 		return "enter: write value • esc: cancel • tab: matches"
 	case m.lastScan != "":
-		return "enter to scan • empty enter: repeat “" + m.lastScan + "” • ctrl+p: pause watch • tab: matches • quit/ctrl+c/ctrl+d"
+		return "enter: scan • empty enter: repeat “" + m.lastScan + "” • ↑/↓ history • ctrl+p: pause watch • tab: matches • quit"
 	default:
-		return "value/comparison + enter to scan • :pid :run :type :set • ctrl+p: pause watch • tab: matches • ctrl+z undo • quit/ctrl+c/ctrl+d"
+		return "enter: scan • :pid :run :type :set • ↑/↓ history • ctrl+p: pause watch • tab: matches • ctrl+z undo • quit/ctrl+c/ctrl+d"
 	}
 }

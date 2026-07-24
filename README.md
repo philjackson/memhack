@@ -56,6 +56,7 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
   as the CLI work: `1337`, `> 100`, `10..20`, `changed`, `inc`, `dec 5`, …
 - **Enter on an empty input repeats the last scan** — hold it down to keep
   narrowing (e.g. `inc`/`changed`) as a value keeps changing.
+- **↑/↓ (or Ctrl+K/Ctrl+J) recall previous/next entered commands** in the input.
 - **Esc cancels a scan in progress** (a full-memory first scan can take a
   while); the match set is left untouched.
 - **The values are watched live** at a configurable interval (`-watch`,
