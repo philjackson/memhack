@@ -391,7 +391,7 @@ func (m model) command(line string) (tea.Model, tea.Cmd) {
 		return m.issue(m.ctrl.launch(fields[1:]))
 	case "type":
 		if len(fields) != 2 {
-			m.errMsg = "usage: :type <i8|i16|i32|i64|u8..u64|f32|f64>"
+			m.errMsg = "usage: :type <i8..u64|f32|f64|bytes|string>"
 			return m, nil
 		}
 		return m.issue(m.ctrl.setType(fields[1]))

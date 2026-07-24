@@ -35,8 +35,9 @@ func buildTarget(t *testing.T) string {
 	const program = `
 #include <unistd.h>
 volatile int magic = 1337;
+volatile char tag[16] = "PLAYER_ONE";
 int main(void) {
-    for (;;) { sleep(1); (void)magic; }
+    for (;;) { sleep(1); (void)magic; (void)tag[0]; }
     return 0;
 }
 `
@@ -238,6 +239,63 @@ func TestDetachedBetweenOperations(t *testing.T) {
 		if proc.Attached() {
 			t.Error("process should be detached after a write")
 		}
+	}
+}
+
+func TestStringAndBytesScan(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	bin := buildTarget(t)
+	proc, err := memory.Launch(bin)
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied") {
+			t.Skipf("ptrace not permitted here: %v", err)
+		}
+		t.Fatalf("launch: %v", err)
+	}
+	defer func() {
+		proc.Close()
+		if p, err := os.FindProcess(proc.Pid); err == nil {
+			_ = p.Kill()
+			_, _ = p.Wait()
+		}
+	}()
+
+	// String scan for the known global.
+	s := NewScanner(proc, String)
+	if err := s.Scan(Cond{Op: Equal, Bytes: []byte("PLAYER_ONE")}); err != nil {
+		t.Fatalf("string scan: %v", err)
+	}
+	if len(s.Matches) == 0 {
+		t.Fatal("expected to find the PLAYER_ONE string")
+	}
+	if got := String.Format(s.Matches[0].Last); got != "PLAYER_ONE" {
+		t.Errorf("match value = %q, want PLAYER_ONE", got)
+	}
+	if proc.Attached() {
+		t.Error("process should be detached after a string scan")
+	}
+
+	// Byte-array scan for the same bytes (hex of "PLAYER_ONE" starts 50 4c 41).
+	b := NewScanner(proc, Bytes)
+	if err := b.Scan(Cond{Op: Equal, Bytes: []byte{0x50, 0x4c, 0x41, 0x59}}); err != nil { // "PLAY"
+		t.Fatalf("bytes scan: %v", err)
+	}
+	if len(b.Matches) == 0 {
+		t.Fatal("expected to find the PLAY byte pattern")
+	}
+	if got := Bytes.Format(b.Matches[0].Last); got != "50 4c 41 59" {
+		t.Errorf("match value = %q, want \"50 4c 41 59\"", got)
+	}
+
+	// Narrowing a string scan with 'unchanged' keeps the (static) match.
+	before := len(s.Matches)
+	if err := s.Scan(Cond{Op: Unchanged}); err != nil {
+		t.Fatalf("unchanged narrow: %v", err)
+	}
+	if len(s.Matches) != before {
+		t.Errorf("unchanged narrow changed the count: %d -> %d", before, len(s.Matches))
 	}
 }
 

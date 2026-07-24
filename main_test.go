@@ -1,11 +1,45 @@
 package main
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
 	"github.com/phil/memhack/internal/scan"
 )
+
+func TestParseScanBytesAndString(t *testing.T) {
+	// String mode: the whole line is a literal pattern.
+	c, err := parseScan("PLAYER_ONE", scan.String)
+	if err != nil {
+		t.Fatalf("string parse: %v", err)
+	}
+	if c.Op != scan.Equal || string(c.Bytes) != "PLAYER_ONE" {
+		t.Errorf("string parse = %+v", c)
+	}
+
+	// Quotes let a keyword be taken literally rather than as a relative op.
+	c, _ = parseScan(`"changed"`, scan.String)
+	if c.Op != scan.Equal || string(c.Bytes) != "changed" {
+		t.Errorf("quoted string parse = %+v", c)
+	}
+	// Bare keyword is the relative op.
+	if c, _ := parseScan("changed", scan.String); c.Op != scan.Changed {
+		t.Errorf("bare 'changed' should be the Changed op, got %+v", c)
+	}
+
+	// Bytes mode: hex pattern.
+	c, err = parseScan("de ad be ef", scan.Bytes)
+	if err != nil {
+		t.Fatalf("bytes parse: %v", err)
+	}
+	if c.Op != scan.Equal || !bytes.Equal(c.Bytes, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Errorf("bytes parse = %+v", c)
+	}
+	if _, err := parseScan("nothex", scan.Bytes); err == nil {
+		t.Error("invalid hex should error in bytes mode")
+	}
+}
 
 func TestParseScan(t *testing.T) {
 	tests := []struct {

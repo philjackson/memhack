@@ -27,7 +27,7 @@ import (
 func main() {
 	pidFlag := flag.Int("pid", 0, "attach to this process id on startup")
 	execFlag := flag.String("exec", "", "launch this program as a child and attach to it")
-	typeFlag := flag.String("type", "i32", "initial data type (i8/i16/i32/i64/u8..u64/f32/f64)")
+	typeFlag := flag.String("type", "i32", "initial data type (i8..u64, f32/f64, bytes, string)")
 	watchFlag := flag.Duration("watch", defaultWatchInterval, "live-watch refresh interval in the TUI (e.g. 500ms, 2s)")
 	replFlag := flag.Bool("repl", false, "use the line-based REPL instead of the TUI")
 	flag.Parse()
@@ -502,8 +502,15 @@ func (a *app) cmdScan(line string) {
 //
 // The relative-by-amount forms use a separated operator ("- 5", "dec 5");
 // a glued "-5" is instead read as the negative literal −5.
+//
+// For Bytes/String types the whole line is a literal pattern instead (with
+// "changed"/"unchanged" still recognised as relative scans).
 func parseScan(line string, dt scan.DataType) (scan.Cond, error) {
 	line = strings.TrimSpace(line)
+
+	if dt.IsBytes() {
+		return parseBytesScan(line, dt)
+	}
 
 	// Range: "lo..hi" (whitespace around ".." is allowed).
 	if i := strings.Index(line, ".."); i >= 0 {
@@ -583,6 +590,25 @@ func parseScan(line string, dt scan.DataType) (scan.Cond, error) {
 	return scan.Cond{Op: op, Value: v}, nil
 }
 
+// parseBytesScan parses a scan line for Bytes/String types: the line is a
+// literal pattern, except for the "changed"/"unchanged" relative keywords.
+func parseBytesScan(line string, dt scan.DataType) (scan.Cond, error) {
+	switch line {
+	case "changed":
+		return scan.Cond{Op: scan.Changed}, nil
+	case "unchanged":
+		return scan.Cond{Op: scan.Unchanged}, nil
+	}
+	pat, err := dt.Encode(line)
+	if err != nil {
+		return scan.Cond{}, err
+	}
+	if len(pat) == 0 {
+		return scan.Cond{}, fmt.Errorf("empty pattern")
+	}
+	return scan.Cond{Op: scan.Equal, Bytes: pat}, nil
+}
+
 // decodeLiteral validates a textual value against the current type and returns
 // the float representation the scanner compares with.
 func decodeLiteral(dt scan.DataType, s string) (float64, error) {
@@ -612,7 +638,7 @@ func printHelp() {
   pid <pid>          attach to a running process
   run <prog> [args]  launch a program as a child and attach (works under a
                      restrictive ptrace_scope, unlike attaching by pid)
-  type [t]           show or set data type (i8/i16/i32/i64/u8..u64/f32/f64)
+  type [t]           show or set data type (i8..u64, f32/f64, bytes, string)
   regions            list scannable memory regions of the target
 
   <value>            scan: keep locations equal to <value> (e.g. 1337, -5)

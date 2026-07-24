@@ -64,6 +64,10 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
   runs freely between ticks. **Ctrl+P pauses/resumes** the watch — while paused
   (or before you have any matches) memhack never touches the target at all.
 - The **matches table** shows current values, refreshed live a few times a second.
+- **Byte-array and string scanning**: `:type bytes` then a hex pattern
+  (`de ad be ef`, `deadbeef`, `de:ad`), or `:type string` then literal text
+  (`PLAYER_ONE`). Both narrow with `changed`/`unchanged`; wrap a string in
+  double quotes to match a keyword or padded text literally (`"changed"`).
 - **Tab** switches focus between the input and the table. With the table focused,
   **↑/↓** select a row and **w** (or **Enter**) edits its value in place.
 - **`:` commands**: `:pid N`, `:run prog args`, `:type f32`, `:set N value`,
@@ -169,7 +173,7 @@ internal/scan/scanner.go   scan + narrow + write engine
 
 This is an early scaffold. Natural next steps:
 
-- Byte-array / string / regex scanning, and unknown-initial-value scans.
+- Regex / wildcard byte-pattern scanning, and unknown-initial-value scans.
 - Value "freezing" — a background loop that keeps rewriting an address.
 - Alignment option (align scans to the type width for speed).
 - Disassembly / pointer-map following.

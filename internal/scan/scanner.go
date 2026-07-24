@@ -1,6 +1,7 @@
 package scan
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -50,6 +51,7 @@ type Cond struct {
 	Value  float64 // target, or lower bound for InRange
 	Value2 float64 // inclusive upper bound for InRange
 	Delta  float64 // exact change amount for IncreasedBy/DecreasedBy
+	Bytes  []byte  // literal pattern for Bytes/String scans (Equal/NotEqual)
 }
 
 // test evaluates the condition given the current and previous decoded values.
@@ -81,6 +83,21 @@ func (c Cond) test(cur, prev float64, havePrev bool) bool {
 		return havePrev && cur == prev+c.Delta
 	case DecreasedBy:
 		return havePrev && cur == prev-c.Delta
+	}
+	return false
+}
+
+// testBytes evaluates the condition for a variable-width Bytes/String scan.
+func (c Cond) testBytes(cur, prev []byte, havePrev bool) bool {
+	switch c.Op {
+	case Equal:
+		return bytes.Equal(cur, c.Bytes)
+	case NotEqual:
+		return !bytes.Equal(cur, c.Bytes)
+	case Changed:
+		return havePrev && !bytes.Equal(cur, prev)
+	case Unchanged:
+		return havePrev && bytes.Equal(cur, prev)
 	}
 	return false
 }
@@ -195,6 +212,9 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 	if c.Op.needsPrev() {
 		return fmt.Errorf("relative scan (changed/increased/...) needs a prior scan")
 	}
+	if s.Type.IsBytes() {
+		return s.firstBytes(ctx, c)
+	}
 	if err := s.proc.Attach(); err != nil {
 		return err
 	}
@@ -248,6 +268,9 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 
 // narrow re-reads each existing match and keeps those still satisfying c.
 func (s *Scanner) narrow(ctx context.Context, c Cond) error {
+	if s.Type.IsBytes() {
+		return s.narrowBytes(ctx, c)
+	}
 	if err := s.proc.Attach(); err != nil {
 		return err
 	}
@@ -284,6 +307,94 @@ func (s *Scanner) narrow(ctx context.Context, c Cond) error {
 	return nil
 }
 
+// firstBytes performs the initial sweep for a Bytes/String scan, collecting
+// every occurrence of the literal pattern c.Bytes.
+func (s *Scanner) firstBytes(ctx context.Context, c Cond) error {
+	if len(c.Bytes) == 0 {
+		return fmt.Errorf("byte/string scan needs a pattern to search for")
+	}
+	if err := s.proc.Attach(); err != nil {
+		return err
+	}
+	defer s.proc.Detach()
+	regions, err := memory.ReadMaps(s.proc.Pid)
+	if err != nil {
+		return err
+	}
+	w := len(c.Bytes)
+	var matches []Match
+	buf := make([]byte, chunkSize)
+
+	for _, r := range regions {
+		if !r.Scannable() {
+			continue
+		}
+		for addr := r.Start; addr < r.End; {
+			if ctx.Err() != nil {
+				return ErrCancelled
+			}
+			n := chunkSize
+			if remain := r.End - addr; uint64(n) > remain {
+				n = int(remain)
+			}
+			got, err := s.proc.ReadAt(buf[:n], addr)
+			if err != nil || got < w {
+				addr += uint64(n)
+				continue
+			}
+			for off := 0; off+w <= got; off++ {
+				if bytes.Equal(buf[off:off+w], c.Bytes) {
+					last := make([]byte, w)
+					copy(last, buf[off:off+w])
+					matches = append(matches, Match{Addr: addr + uint64(off), Last: last})
+				}
+			}
+			addr += uint64(got)
+		}
+	}
+	s.Matches = matches
+	s.scanned = true
+	return nil
+}
+
+// narrowBytes narrows a Bytes/String match set. Equal/NotEqual re-check against
+// the new pattern; Changed/Unchanged compare each match's current bytes to what
+// was last seen there.
+func (s *Scanner) narrowBytes(ctx context.Context, c Cond) error {
+	if err := s.proc.Attach(); err != nil {
+		return err
+	}
+	defer s.proc.Detach()
+	var kept []Match
+
+	for i, m := range s.Matches {
+		if i%4096 == 0 && ctx.Err() != nil {
+			return ErrCancelled
+		}
+		w := len(m.Last)
+		if c.Op == Equal || c.Op == NotEqual {
+			w = len(c.Bytes)
+		}
+		if w == 0 {
+			continue
+		}
+		buf := make([]byte, w)
+		got, err := s.proc.ReadAt(buf, m.Addr)
+		if err != nil || got < w {
+			continue
+		}
+		cur := buf[:got]
+		if !c.testBytes(cur, m.Last, len(m.Last) > 0) {
+			continue
+		}
+		last := make([]byte, len(cur))
+		copy(last, cur)
+		kept = append(kept, Match{Addr: m.Addr, Last: last})
+	}
+	s.Matches = kept
+	return nil
+}
+
 // Refresh re-reads the current value at every match without filtering,
 // updating the stored Last bytes.
 func (s *Scanner) Refresh() { s.RefreshN(len(s.Matches)) }
@@ -302,10 +413,19 @@ func (s *Scanner) RefreshN(n int) {
 		return
 	}
 	defer s.proc.Detach()
-	size := s.Type.Size()
-	buf := make([]byte, size)
+	// Numeric types have a fixed width; Bytes/String use each match's own
+	// stored width (Size() is 0 for them).
+	fixed := s.Type.Size()
 	for i := 0; i < n; i++ {
-		if got, err := s.proc.ReadAt(buf, s.Matches[i].Addr); err == nil && got >= size {
+		w := fixed
+		if w == 0 {
+			w = len(s.Matches[i].Last)
+		}
+		if w == 0 {
+			continue
+		}
+		buf := make([]byte, w)
+		if got, err := s.proc.ReadAt(buf, s.Matches[i].Addr); err == nil && got >= w {
 			copy(s.Matches[i].Last, buf)
 		}
 	}

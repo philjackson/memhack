@@ -8,7 +8,7 @@ import (
 )
 
 // allTypes is every data type the scanner understands.
-var allTypes = []DataType{I8, I16, I32, I64, U8, U16, U32, U64, F32, F64}
+var allTypes = []DataType{I8, I16, I32, I64, U8, U16, U32, U64, F32, F64, Bytes, String}
 
 func TestDataTypeSize(t *testing.T) {
 	want := map[DataType]int{
@@ -16,6 +16,7 @@ func TestDataTypeSize(t *testing.T) {
 		I16: 2, U16: 2,
 		I32: 4, U32: 4, F32: 4,
 		I64: 8, U64: 8, F64: 8,
+		Bytes: 0, String: 0, // variable-width
 	}
 	for _, typ := range allTypes {
 		if got := typ.Size(); got != want[typ] {
@@ -165,6 +166,43 @@ func TestDecodeShortBuffer(t *testing.T) {
 	}
 }
 
+func TestBytesEncodeFormat(t *testing.T) {
+	// Hex parsing accepts spaces, ':'/'-' separators, and an optional 0x.
+	for _, in := range []string{"deadbeef", "de ad be ef", "DE:AD:BE:EF", "de-ad-be-ef", "0xdeadbeef"} {
+		raw, err := Bytes.Encode(in)
+		if err != nil {
+			t.Fatalf("Bytes.Encode(%q): %v", in, err)
+		}
+		want := []byte{0xde, 0xad, 0xbe, 0xef}
+		if !bytes.Equal(raw, want) {
+			t.Errorf("Bytes.Encode(%q) = % x, want % x", in, raw, want)
+		}
+	}
+	if _, err := Bytes.Encode("xyz"); err == nil {
+		t.Error("Bytes.Encode(xyz): expected error for invalid hex")
+	}
+	if got := Bytes.Format([]byte{0x01, 0xab}); got != "01 ab" {
+		t.Errorf("Bytes.Format = %q, want \"01 ab\"", got)
+	}
+	if !Bytes.IsBytes() || Bytes.Size() != 0 {
+		t.Error("Bytes should be a variable-width (IsBytes, Size 0) type")
+	}
+}
+
+func TestStringEncodeFormat(t *testing.T) {
+	raw, err := String.Encode("hello")
+	if err != nil || string(raw) != "hello" {
+		t.Fatalf("String.Encode = %q, %v", raw, err)
+	}
+	// Quotes preserve a keyword-like or padded literal.
+	if raw, _ := String.Encode(`"changed"`); string(raw) != "changed" {
+		t.Errorf("quoted encode = %q, want changed", raw)
+	}
+	if got := String.Format([]byte("hi\x00\x01")); got != "hi.." {
+		t.Errorf("String.Format = %q, want \"hi..\" (non-printable as dots)", got)
+	}
+}
+
 func TestParseDataType(t *testing.T) {
 	// Every canonical name and alias must map to the expected type.
 	want := map[string]DataType{
@@ -178,6 +216,8 @@ func TestParseDataType(t *testing.T) {
 		"u64": U64, "uint64": U64,
 		"f32": F32, "float": F32, "float32": F32,
 		"f64": F64, "double": F64, "float64": F64,
+		"bytes": Bytes, "aob": Bytes,
+		"string": String, "str": String, "text": String,
 	}
 	for name, typ := range want {
 		got, err := ParseDataType(name)

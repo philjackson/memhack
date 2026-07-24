@@ -2,12 +2,15 @@ package scan
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 )
 
-// DataType identifies the numeric type used to interpret raw memory.
+// DataType identifies how raw memory is interpreted for a scan. Most types are
+// fixed-width numbers; Bytes and String are variable-width literal patterns.
 type DataType int
 
 const (
@@ -21,6 +24,8 @@ const (
 	U64
 	F32
 	F64
+	Bytes  // a literal byte pattern, entered as hex (e.g. "de ad be ef")
+	String // a literal text pattern
 )
 
 // Size returns the width in bytes of the data type.
@@ -60,6 +65,10 @@ func (t DataType) String() string {
 		return "f32"
 	case F64:
 		return "f64"
+	case Bytes:
+		return "bytes"
+	case String:
+		return "string"
 	}
 	return "?"
 }
@@ -87,12 +96,20 @@ func ParseDataType(s string) (DataType, error) {
 		return F32, nil
 	case "f64", "double", "float64":
 		return F64, nil
+	case "bytes", "byte-array", "aob":
+		return Bytes, nil
+	case "string", "str", "text":
+		return String, nil
 	}
 	return 0, fmt.Errorf("unknown data type %q", s)
 }
 
 // IsFloat reports whether the type is a floating-point type.
 func (t DataType) IsFloat() bool { return t == F32 || t == F64 }
+
+// IsBytes reports whether the type is a variable-width literal pattern
+// (Bytes or String) rather than a fixed-width number.
+func (t DataType) IsBytes() bool { return t == Bytes || t == String }
 
 // Decode interprets the leading Size() bytes of buf as a float64 for
 // comparison purposes. Integers are widened losslessly enough for the
@@ -126,8 +143,16 @@ func (t DataType) Decode(buf []byte) (float64, bool) {
 	return 0, false
 }
 
-// Encode converts a textual value into raw little-endian bytes of this type.
+// Encode converts a textual value into raw bytes of this type: little-endian
+// for numbers, the literal pattern for Bytes/String.
 func (t DataType) Encode(s string) ([]byte, error) {
+	switch t {
+	case String:
+		return []byte(unquote(s)), nil
+	case Bytes:
+		return parseHexBytes(s)
+	}
+
 	buf := make([]byte, t.Size())
 	if t.IsFloat() {
 		v, err := strconv.ParseFloat(s, 64)
@@ -168,6 +193,9 @@ func (t DataType) Encode(s string) ([]byte, error) {
 
 // Format renders the leading bytes of buf as a human-readable value.
 func (t DataType) Format(buf []byte) string {
+	if t.IsBytes() {
+		return t.formatBytes(buf)
+	}
 	v, ok := t.Decode(buf)
 	if !ok {
 		return "?"
@@ -176,4 +204,68 @@ func (t DataType) Format(buf []byte) string {
 		return strconv.FormatFloat(v, 'g', -1, 64)
 	}
 	return strconv.FormatInt(int64(v), 10)
+}
+
+// formatDisplayCap bounds how many bytes Format renders for a byte/string
+// value, so a long match doesn't blow out the display.
+const formatDisplayCap = 32
+
+func (t DataType) formatBytes(buf []byte) string {
+	b, truncated := buf, false
+	if len(b) > formatDisplayCap {
+		b, truncated = b[:formatDisplayCap], true
+	}
+	var s string
+	if t == String {
+		r := make([]byte, len(b))
+		for i, c := range b {
+			if c >= 0x20 && c < 0x7f {
+				r[i] = c
+			} else {
+				r[i] = '.' // render non-printable bytes as dots
+			}
+		}
+		s = string(r)
+	} else {
+		parts := make([]string, len(b))
+		for i, c := range b {
+			parts[i] = fmt.Sprintf("%02x", c)
+		}
+		s = strings.Join(parts, " ")
+	}
+	if truncated {
+		s += "…"
+	}
+	return s
+}
+
+// unquote strips a single pair of surrounding double quotes, so a literal
+// string can preserve leading/trailing spaces or look like a keyword.
+func unquote(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// parseHexBytes parses a hex byte pattern, ignoring spaces and ':'/'-'
+// separators and an optional leading "0x".
+func parseHexBytes(s string) ([]byte, error) {
+	clean := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', ':', '-':
+			return -1
+		}
+		return r
+	}, s)
+	clean = strings.TrimPrefix(clean, "0x")
+	clean = strings.TrimPrefix(clean, "0X")
+	if clean == "" {
+		return nil, fmt.Errorf("empty byte pattern")
+	}
+	b, err := hex.DecodeString(clean)
+	if err != nil {
+		return nil, fmt.Errorf("invalid hex bytes %q: %w", s, err)
+	}
+	return b, nil
 }
