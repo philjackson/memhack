@@ -69,9 +69,16 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
   (`PLAYER_ONE`). Both narrow with `changed`/`unchanged`; wrap a string in
   double quotes to match a keyword or padded text literally (`"changed"`).
 - **Tab** switches focus between the input and the table. With the table focused,
-  **↑/↓** select a row and **w** (or **Enter**) edits its value in place.
+  **↑/↓** select a row, **w** (or **Enter**) edits its value in place, and **f**
+  freezes/unfreezes it.
+- **Value freezing**: press **f** on a match to pin it — memhack then rewrites
+  that address with its captured value on an interval (`-freeze`, default 100ms),
+  holding it against the target's own writes (infinite health, frozen timers, …).
+  Frozen rows are marked `*`; the status bar shows how many are frozen. Set a new
+  value first (edit it), then freeze, to pin an arbitrary value. `:unfreeze`
+  clears all freezes.
 - **`:` commands**: `:pid N`, `:run prog args`, `:type f32`, `:set N value`,
-  `:setall value`, `:reset`, `:undo`, `:q`.
+  `:setall value`, `:freeze N`, `:unfreeze`, `:reset`, `:undo`, `:q`.
 - **Ctrl+Z** undo, **Ctrl+R** reset. **Quit** with `quit` (or `:q`), **Ctrl+C**, or **Ctrl+D**.
 - While a scan or write is running, an animated spinner (`⣾ working…`) shows in
   the status bar; it appears only while work is in flight.
@@ -174,7 +181,6 @@ internal/scan/scanner.go   scan + narrow + write engine
 This is an early scaffold. Natural next steps:
 
 - Regex / wildcard byte-pattern scanning, and unknown-initial-value scans.
-- Value "freezing" — a background loop that keeps rewriting an address.
 - Alignment option (align scans to the type width for speed).
 - Disassembly / pointer-map following.
 

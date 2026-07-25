@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -18,13 +19,17 @@ import (
 // only ever shows a window of it.
 const displayLimit = 500
 
+// defaultFreezeInterval is how often frozen addresses are rewritten.
+const defaultFreezeInterval = 100 * time.Millisecond
+
 var errNotAttached = errors.New("not attached to a process")
 
 // matchRow is one match formatted for display.
 type matchRow struct {
-	Index int
-	Addr  uint64
-	Value string
+	Index  int
+	Addr   uint64
+	Value  string
+	Frozen bool
 }
 
 // state is a snapshot of the worker's condition, sent to the UI after every
@@ -36,6 +41,7 @@ type state struct {
 	Count    int
 	Scanned  bool
 	CanUndo  bool
+	Frozen   int
 	Rows     []matchRow
 	Note     string // human-readable result of the last action
 	Err      error
@@ -64,6 +70,11 @@ type worker struct {
 	proc *memory.Process
 	sc   *scan.Scanner
 	dt   scan.DataType
+
+	// frozen maps an address to the bytes that are continually rewritten there
+	// by the freeze ticker, holding its value against the target's own writes.
+	frozen      map[uint64][]byte
+	freezeEvery time.Duration
 }
 
 // controller is the UI-facing handle to the worker. Its methods return
@@ -80,8 +91,18 @@ type controller struct {
 }
 
 // newController starts the worker goroutine and returns a controller for it.
-func newController(initial scan.DataType) *controller {
-	w := &worker{jobs: make(chan job), dt: initial}
+// freezeEvery is how often frozen addresses are rewritten (<= 0 uses the
+// default).
+func newController(initial scan.DataType, freezeEvery time.Duration) *controller {
+	if freezeEvery <= 0 {
+		freezeEvery = defaultFreezeInterval
+	}
+	w := &worker{
+		jobs:        make(chan job),
+		dt:          initial,
+		frozen:      map[uint64][]byte{},
+		freezeEvery: freezeEvery,
+	}
 	go w.loop()
 	return &controller{jobs: w.jobs}
 }
@@ -107,12 +128,41 @@ func (w *worker) loop() {
 	// Pin to one OS thread for the lifetime of the worker: ptrace binds the
 	// tracer to the thread that attached, so every job must run on it.
 	runtime.LockOSThread()
-	for j := range w.jobs {
-		note, err := j.run(w)
-		st := w.snapshot()
-		st.Note = note
-		st.Err = err
-		j.reply <- st
+
+	// The freeze ticker rewrites frozen addresses. It runs on this same thread,
+	// interleaved with jobs, so it never races the scanner's ptrace state.
+	ticker := time.NewTicker(w.freezeEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case j, ok := <-w.jobs:
+			if !ok {
+				return
+			}
+			note, err := j.run(w)
+			st := w.snapshot()
+			st.Note = note
+			st.Err = err
+			j.reply <- st
+		case <-ticker.C:
+			w.applyFreezes()
+		}
+	}
+}
+
+// applyFreezes rewrites every frozen address once. It attaches only if there
+// is something to freeze, so an idle target with no freezes is never touched.
+func (w *worker) applyFreezes() {
+	if w.proc == nil || len(w.frozen) == 0 {
+		return
+	}
+	if err := w.proc.Attach(); err != nil {
+		return
+	}
+	defer w.proc.Detach()
+	for addr, raw := range w.frozen {
+		w.proc.WriteAt(raw, addr)
 	}
 }
 
@@ -130,6 +180,8 @@ func (w *worker) snapshot() state {
 	st.Scanned = w.sc.Scanned()
 	st.CanUndo = w.sc.CanUndo()
 
+	st.Frozen = len(w.frozen)
+
 	n := st.Count
 	if n > displayLimit {
 		n = displayLimit
@@ -138,7 +190,8 @@ func (w *worker) snapshot() state {
 	st.Rows = make([]matchRow, 0, n)
 	for i := 0; i < n; i++ {
 		m := w.sc.Matches[i]
-		st.Rows = append(st.Rows, matchRow{Index: i, Addr: m.Addr, Value: w.dt.Format(m.Last)})
+		_, frozen := w.frozen[m.Addr]
+		st.Rows = append(st.Rows, matchRow{Index: i, Addr: m.Addr, Value: w.dt.Format(m.Last), Frozen: frozen})
 	}
 	return st
 }
@@ -208,6 +261,14 @@ func (c *controller) setType(name string) tea.Cmd {
 	return c.submit(func(w *worker) (string, error) { return w.setType(name) })
 }
 
+func (c *controller) freeze(index int) tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.freezeIndex(index) })
+}
+
+func (c *controller) unfreezeAll() tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.unfreezeAll() })
+}
+
 // --- worker request handlers (all run on the locked thread) ---
 
 func (w *worker) attach(pid int) (string, error) {
@@ -255,6 +316,35 @@ func (w *worker) detach() {
 		w.proc = nil
 	}
 	w.sc = nil
+	// Freezes belong to the previous process; drop them.
+	w.frozen = map[uint64][]byte{}
+}
+
+// freezeIndex toggles the freeze state of match #i, capturing its current
+// value when freezing.
+func (w *worker) freezeIndex(i int) (string, error) {
+	if w.sc == nil {
+		return "", errNotAttached
+	}
+	if i < 0 || i >= len(w.sc.Matches) {
+		return "", fmt.Errorf("no match #%d", i)
+	}
+	m := w.sc.Matches[i]
+	if _, ok := w.frozen[m.Addr]; ok {
+		delete(w.frozen, m.Addr)
+		return fmt.Sprintf("unfroze %#x", m.Addr), nil
+	}
+	raw := make([]byte, len(m.Last))
+	copy(raw, m.Last)
+	w.frozen[m.Addr] = raw
+	return fmt.Sprintf("froze %#x = %s", m.Addr, w.dt.Format(raw)), nil
+}
+
+// unfreezeAll clears every frozen address.
+func (w *worker) unfreezeAll() (string, error) {
+	n := len(w.frozen)
+	w.frozen = map[uint64][]byte{}
+	return fmt.Sprintf("unfroze %d address(es)", n), nil
 }
 
 func (w *worker) scanExpr(ctx context.Context, expr string) (string, error) {

@@ -221,6 +221,41 @@ func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {
 	}
 }
 
+func TestFreezeKeyIssuesCommand(t *testing.T) {
+	m := newTestModel()
+	m2, _ := m.Update(stateMsg(state{
+		Attached: true, Type: scan.I32, Count: 1, Scanned: true,
+		Rows: []matchRow{{Index: 0, Addr: 0x1000, Value: "5"}},
+	}))
+	m = m2.(model)
+	nm, _ := m.Update(press("tab"))
+	m = nm.(model)
+	nm, cmd := m.Update(press("f"))
+	m = nm.(model)
+	if cmd == nil {
+		t.Error("f (table focused) should issue a freeze command")
+	}
+	if !m.busy {
+		t.Error("issuing a freeze should mark the model busy")
+	}
+}
+
+func TestFrozenShownInStatusAndTable(t *testing.T) {
+	m := newTestModel()
+	m2, _ := m.Update(stateMsg(state{
+		Attached: true, Pid: 1, Type: scan.I32, Count: 1, Scanned: true, Frozen: 1,
+		Rows: []matchRow{{Index: 0, Addr: 0x1000, Value: "5", Frozen: true}},
+	}))
+	m = m2.(model)
+	if !strings.Contains(m.View(), "1 frozen") {
+		t.Error("status should show the frozen count")
+	}
+	rows := m.table.Rows()
+	if len(rows) == 0 || rows[0][0] != "*" {
+		t.Errorf("frozen row should carry the marker; row0 = %v", rows)
+	}
+}
+
 func TestWatchPauseToggle(t *testing.T) {
 	m := newTestModel()
 	if m.watchPaused {

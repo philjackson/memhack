@@ -92,6 +92,7 @@ func newModel(ctrl *controller, dt scan.DataType, startup tea.Cmd, start screen,
 	ti.Focus()
 
 	cols := []table.Column{
+		{Title: "❄", Width: 2},
 		{Title: "#", Width: 6},
 		{Title: "Address", Width: 18},
 		{Title: "Value", Width: 20},
@@ -278,6 +279,19 @@ func (m model) handleTableKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.Prompt = fmt.Sprintf("write #%d ‹%s› = ", m.writeIdx, m.st.Rows[cur].Value)
 		m.input.Focus()
 		return m, textinput.Blink
+	case "f":
+		// Toggle freezing the selected match at its current value.
+		if len(m.st.Rows) == 0 {
+			return m, nil
+		}
+		cur := m.table.Cursor()
+		if cur < 0 {
+			cur = 0
+		}
+		if cur >= len(m.st.Rows) {
+			return m, nil
+		}
+		return m.issue(m.ctrl.freeze(m.st.Rows[cur].Index))
 	}
 	var cmd tea.Cmd
 	m.table, cmd = m.table.Update(msg)
@@ -416,6 +430,19 @@ func (m model) command(line string) (tea.Model, tea.Cmd) {
 		return m.issue(m.ctrl.reset())
 	case "undo":
 		return m.issue(m.ctrl.undo())
+	case "freeze":
+		if len(fields) != 2 {
+			m.errMsg = "usage: :freeze <index>"
+			return m, nil
+		}
+		idx, err := strconv.Atoi(fields[1])
+		if err != nil {
+			m.errMsg = "invalid index: " + fields[1]
+			return m, nil
+		}
+		return m.issue(m.ctrl.freeze(idx))
+	case "unfreeze":
+		return m.issue(m.ctrl.unfreezeAll())
 	default:
 		m.errMsg = "unknown command: " + fields[0]
 		return m, nil
@@ -505,7 +532,12 @@ func (m *model) resetInputToScan() {
 func (m *model) refreshTable() {
 	rows := make([]table.Row, 0, len(m.st.Rows))
 	for _, r := range m.st.Rows {
+		mark := ""
+		if r.Frozen {
+			mark = "*"
+		}
 		rows = append(rows, table.Row{
+			mark,
 			strconv.Itoa(r.Index),
 			fmt.Sprintf("%#012x", r.Addr),
 			r.Value,
@@ -525,12 +557,13 @@ func (m *model) layout() {
 	}
 	m.input.Width = m.width - 12
 
-	idxW, addrW := 6, 18
-	valW := m.width - idxW - addrW - 10
+	frzW, idxW, addrW := 2, 6, 18
+	valW := m.width - frzW - idxW - addrW - 12
 	if valW < 10 {
 		valW = 10
 	}
 	m.table.SetColumns([]table.Column{
+		{Title: "❄", Width: frzW},
 		{Title: "#", Width: idxW},
 		{Title: "Address", Width: addrW},
 		{Title: "Value", Width: valW},
@@ -590,7 +623,11 @@ func (m model) statusLine() string {
 	if m.watchPaused {
 		watch = "watch paused"
 	}
-	line := statusStyle.Render(fmt.Sprintf("%s │ type %s │ %s │ %s", target, m.st.Type, matches, watch))
+	frozen := ""
+	if m.st.Frozen > 0 {
+		frozen = fmt.Sprintf(" │ %d frozen", m.st.Frozen)
+	}
+	line := statusStyle.Render(fmt.Sprintf("%s │ type %s │ %s │ %s%s", target, m.st.Type, matches, watch, frozen))
 	if m.busy {
 		line += "  " + m.spin.View() + statusStyle.Render(" working…")
 	}
@@ -609,7 +646,7 @@ func (m model) helpText() string {
 	case m.busy && m.ctrl.ScanRunning():
 		return "scanning… • esc: cancel"
 	case m.focusTable:
-		return "↑/↓ select • w/enter edit value • tab: input • ctrl+z undo • ctrl+r reset • ctrl+c quit"
+		return "↑/↓ select • w/enter edit • f: freeze/unfreeze • tab: input • ctrl+z undo • ctrl+r reset • ctrl+c quit"
 	case m.mode == modeWrite:
 		return "enter: write value • esc: cancel • tab: matches"
 	case m.lastScan != "":
