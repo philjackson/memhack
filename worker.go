@@ -42,6 +42,7 @@ type state struct {
 	Scanned  bool
 	CanUndo  bool
 	Frozen   int
+	Align    int
 	Rows     []matchRow
 	Note     string // human-readable result of the last action
 	Err      error
@@ -75,6 +76,9 @@ type worker struct {
 	// by the freeze ticker, holding its value against the target's own writes.
 	frozen      map[uint64][]byte
 	freezeEvery time.Duration
+
+	// align is the scan step applied to new scanners (0 = align to type width).
+	align int
 }
 
 // controller is the UI-facing handle to the worker. Its methods return
@@ -93,15 +97,19 @@ type controller struct {
 // newController starts the worker goroutine and returns a controller for it.
 // freezeEvery is how often frozen addresses are rewritten (<= 0 uses the
 // default).
-func newController(initial scan.DataType, freezeEvery time.Duration) *controller {
+func newController(initial scan.DataType, freezeEvery time.Duration, align int) *controller {
 	if freezeEvery <= 0 {
 		freezeEvery = defaultFreezeInterval
+	}
+	if align < 0 {
+		align = 0
 	}
 	w := &worker{
 		jobs:        make(chan job),
 		dt:          initial,
 		frozen:      map[uint64][]byte{},
 		freezeEvery: freezeEvery,
+		align:       align,
 	}
 	go w.loop()
 	return &controller{jobs: w.jobs}
@@ -181,6 +189,7 @@ func (w *worker) snapshot() state {
 	st.CanUndo = w.sc.CanUndo()
 
 	st.Frozen = len(w.frozen)
+	st.Align = w.sc.Alignment()
 
 	n := st.Count
 	if n > displayLimit {
@@ -269,6 +278,10 @@ func (c *controller) unfreezeAll() tea.Cmd {
 	return c.submit(func(w *worker) (string, error) { return w.unfreezeAll() })
 }
 
+func (c *controller) setAlign(n int) tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.setAlign(n) })
+}
+
 // --- worker request handlers (all run on the locked thread) ---
 
 func (w *worker) attach(pid int) (string, error) {
@@ -287,6 +300,7 @@ func (w *worker) attach(pid int) (string, error) {
 
 	w.proc = proc
 	w.sc = scan.NewScanner(proc, w.dt)
+	w.sc.Align = w.align
 	return fmt.Sprintf("attached to pid %d", pid), nil
 }
 
@@ -307,6 +321,7 @@ func (w *worker) launch(argv []string) (string, error) {
 
 	w.proc = proc
 	w.sc = scan.NewScanner(proc, w.dt)
+	w.sc.Align = w.align
 	return fmt.Sprintf("launched %s as pid %d", argv[0], proc.Pid), nil
 }
 
@@ -433,6 +448,26 @@ func (w *worker) setType(name string) (string, error) {
 	w.dt = dt
 	if w.sc != nil {
 		w.sc.SetType(dt)
+		w.sc.Align = w.align
 	}
 	return fmt.Sprintf("type = %s (matches reset)", dt), nil
+}
+
+// setAlign sets the scan step. n <= 0 means align to the type width; it takes
+// effect on the next initial scan.
+func (w *worker) setAlign(n int) (string, error) {
+	if n < 0 {
+		n = 0
+	}
+	w.align = n
+	if w.sc != nil {
+		w.sc.Align = n
+	}
+	if n == 0 {
+		return "alignment: type width (fast)", nil
+	}
+	if n == 1 {
+		return "alignment: every byte (thorough)", nil
+	}
+	return fmt.Sprintf("alignment: %d bytes", n), nil
 }

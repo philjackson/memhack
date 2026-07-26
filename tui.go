@@ -443,6 +443,17 @@ func (m model) command(line string) (tea.Model, tea.Cmd) {
 		return m.issue(m.ctrl.freeze(idx))
 	case "unfreeze":
 		return m.issue(m.ctrl.unfreezeAll())
+	case "align":
+		if len(fields) != 2 {
+			m.errMsg = "usage: :align <n|type> (0/type = type width, 1 = every byte)"
+			return m, nil
+		}
+		n, err := parseAlign(fields[1])
+		if err != nil {
+			m.errMsg = err.Error()
+			return m, nil
+		}
+		return m.issue(m.ctrl.setAlign(n))
 	default:
 		m.errMsg = "unknown command: " + fields[0]
 		return m, nil
@@ -623,11 +634,15 @@ func (m model) statusLine() string {
 	if m.watchPaused {
 		watch = "watch paused"
 	}
+	align := "align type"
+	if m.st.Align > 0 {
+		align = fmt.Sprintf("align %d", m.st.Align)
+	}
 	frozen := ""
 	if m.st.Frozen > 0 {
 		frozen = fmt.Sprintf(" │ %d frozen", m.st.Frozen)
 	}
-	line := statusStyle.Render(fmt.Sprintf("%s │ type %s │ %s │ %s%s", target, m.st.Type, matches, watch, frozen))
+	line := statusStyle.Render(fmt.Sprintf("%s │ type %s │ %s │ %s │ %s%s", target, m.st.Type, matches, align, watch, frozen))
 	if m.busy {
 		line += "  " + m.spin.View() + statusStyle.Render(" working…")
 	}
@@ -652,6 +667,6 @@ func (m model) helpText() string {
 	case m.lastScan != "":
 		return "enter: scan • empty enter: repeat “" + m.lastScan + "” • ↑/↓ history • ctrl+p: pause watch • tab: matches • quit"
 	default:
-		return "enter: scan • :pid :run :type :set • ↑/↓ history • ctrl+p: pause watch • tab: matches • ctrl+z undo • quit/ctrl+c/ctrl+d"
+		return "enter: scan • :type :set :align • ↑/↓ history • ctrl+p: pause watch • tab: matches • ctrl+z undo • quit/ctrl+c/ctrl+d"
 	}
 }

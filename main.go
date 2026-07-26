@@ -30,6 +30,7 @@ func main() {
 	typeFlag := flag.String("type", "i32", "initial data type (i8..u64, f32/f64, bytes, string)")
 	watchFlag := flag.Duration("watch", defaultWatchInterval, "live-watch refresh interval in the TUI (e.g. 500ms, 2s)")
 	freezeFlag := flag.Duration("freeze", defaultFreezeInterval, "how often frozen values are rewritten (e.g. 100ms)")
+	alignFlag := flag.Int("align", 0, "scan alignment in bytes (0 = align to type width, fast; 1 = every byte, thorough)")
 	replFlag := flag.Bool("repl", false, "use the line-based REPL instead of the TUI")
 	flag.Parse()
 
@@ -40,10 +41,10 @@ func main() {
 	}
 
 	if *replFlag {
-		runREPL(dt, *pidFlag, *execFlag, flag.Args())
+		runREPL(dt, *pidFlag, *execFlag, flag.Args(), *alignFlag)
 		return
 	}
-	if err := runTUI(dt, *pidFlag, *execFlag, flag.Args(), *watchFlag, *freezeFlag); err != nil {
+	if err := runTUI(dt, *pidFlag, *execFlag, flag.Args(), *watchFlag, *freezeFlag, *alignFlag); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -52,10 +53,10 @@ func main() {
 // runREPL runs the line-based interface. ptrace binds the tracer to one OS
 // thread, and the REPL is synchronous on this goroutine, so pin it here and
 // every ptrace/mem call rides along.
-func runREPL(dt scan.DataType, pid int, exec string, args []string) {
+func runREPL(dt scan.DataType, pid int, exec string, args []string, align int) {
 	runtime.LockOSThread()
 
-	app := &app{dtype: dt}
+	app := &app{dtype: dt, align: align}
 	switch {
 	case exec != "":
 		if err := app.launch(append([]string{exec}, args...)); err != nil {
@@ -73,8 +74,8 @@ func runREPL(dt scan.DataType, pid int, exec string, args []string) {
 
 // runTUI runs the Bubble Tea interface. ptrace work happens on the worker's
 // own locked thread (see worker.loop), so the UI goroutine stays free.
-func runTUI(dt scan.DataType, pid int, exec string, args []string, watch, freeze time.Duration) error {
-	ctrl := newController(dt, freeze)
+func runTUI(dt scan.DataType, pid int, exec string, args []string, watch, freeze time.Duration, align int) error {
+	ctrl := newController(dt, freeze, align)
 
 	var startup tea.Cmd
 	start := screenScanner
@@ -97,6 +98,7 @@ type app struct {
 	proc    *memory.Process
 	scanner *scan.Scanner
 	dtype   scan.DataType
+	align   int
 }
 
 func (a *app) attach(pid int) error {
@@ -109,6 +111,7 @@ func (a *app) attach(pid int) error {
 	}
 	a.proc = proc
 	a.scanner = scan.NewScanner(proc, a.dtype)
+	a.scanner.Align = a.align
 	fmt.Printf("attached to pid %d (type=%s)\n", pid, a.dtype)
 	return nil
 }
@@ -126,6 +129,7 @@ func (a *app) launch(argv []string) error {
 	}
 	a.proc = proc
 	a.scanner = scan.NewScanner(proc, a.dtype)
+	a.scanner.Align = a.align
 	fmt.Printf("launched %s as pid %d (type=%s)\n", argv[0], proc.Pid, a.dtype)
 	return nil
 }
@@ -176,6 +180,8 @@ func (a *app) dispatch(line string) bool {
 		}
 	case "type":
 		a.cmdType(args)
+	case "align":
+		a.cmdAlign(args)
 	case "regions", "maps":
 		a.cmdRegions()
 	case "list", "ls":
@@ -226,9 +232,47 @@ func (a *app) cmdType(args []string) {
 	a.dtype = dt
 	if a.scanner != nil {
 		a.scanner.SetType(dt)
+		a.scanner.Align = a.align
 		fmt.Println("type set; matches reset")
 	}
 	fmt.Printf("type = %s\n", dt)
+}
+
+func (a *app) cmdAlign(args []string) {
+	if len(args) != 1 {
+		if a.scanner != nil {
+			fmt.Printf("alignment: %d byte(s)\n", a.scanner.Alignment())
+		} else {
+			fmt.Printf("alignment setting: %d (0 = type width)\n", a.align)
+		}
+		return
+	}
+	n, err := parseAlign(args[0])
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	a.align = n
+	if a.scanner != nil {
+		a.scanner.Align = n
+	}
+	fmt.Printf("alignment set to %d (0 = type width; applies to the next scan)\n", n)
+}
+
+// parseAlign parses an alignment argument: "type"/"auto"/"0" = align to the
+// type width, "byte"/"none"/"1" = every byte, or a positive integer.
+func parseAlign(s string) (int, error) {
+	switch s {
+	case "type", "auto", "0":
+		return 0, nil
+	case "byte", "none", "1":
+		return 1, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid alignment %q (use a number, or 'type')", s)
+	}
+	return n, nil
 }
 
 func (a *app) cmdRegions() {
@@ -640,6 +684,7 @@ func printHelp() {
   run <prog> [args]  launch a program as a child and attach (works under a
                      restrictive ptrace_scope, unlike attaching by pid)
   type [t]           show or set data type (i8..u64, f32/f64, bytes, string)
+  align [n]          show/set scan alignment (0=type width, 1=every byte)
   regions            list scannable memory regions of the target
 
   <value>            scan: keep locations equal to <value> (e.g. 1337, -5)

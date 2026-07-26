@@ -13,10 +13,9 @@ import (
 	"github.com/phil/memhack/internal/memory"
 )
 
-// buildTarget compiles a tiny C program that holds a known value in a global
-// and then idles, returning the path to the binary. It skips the test if no C
-// compiler is available.
-func buildTarget(t *testing.T) string {
+// compileTarget compiles the given C program and returns the binary path,
+// skipping the test if no C compiler is available.
+func compileTarget(t *testing.T, program string) string {
 	t.Helper()
 	var cc string
 	for _, c := range []string{"cc", "gcc", "clang"} {
@@ -28,11 +27,22 @@ func buildTarget(t *testing.T) string {
 	if cc == "" {
 		t.Skip("no C compiler available; skipping ptrace integration test")
 	}
-
 	dir := t.TempDir()
 	src := filepath.Join(dir, "target.c")
 	bin := filepath.Join(dir, "target")
-	const program = `
+	if err := os.WriteFile(src, []byte(program), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if out, err := exec.Command(cc, "-O0", "-o", bin, src).CombinedOutput(); err != nil {
+		t.Fatalf("compile target: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// buildTarget compiles the standard test target that holds a known int and
+// string in globals and then idles.
+func buildTarget(t *testing.T) string {
+	return compileTarget(t, `
 #include <unistd.h>
 volatile int magic = 1337;
 volatile char tag[16] = "PLAYER_ONE";
@@ -40,15 +50,7 @@ int main(void) {
     for (;;) { sleep(1); (void)magic; (void)tag[0]; }
     return 0;
 }
-`
-	if err := os.WriteFile(src, []byte(program), 0o644); err != nil {
-		t.Fatalf("write source: %v", err)
-	}
-	out, err := exec.Command(cc, "-O0", "-o", bin, src).CombinedOutput()
-	if err != nil {
-		t.Fatalf("compile target: %v\n%s", err, out)
-	}
-	return bin
+`)
 }
 
 func TestScanWriteRoundTrip(t *testing.T) {
@@ -296,6 +298,64 @@ func TestStringAndBytesScan(t *testing.T) {
 	}
 	if len(s.Matches) != before {
 		t.Errorf("unchanged narrow changed the count: %d -> %d", before, len(s.Matches))
+	}
+}
+
+func TestAlignmentSkipsUnaligned(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// A distinctive value (0x11223344, little-endian 44 33 22 11) placed at an
+	// unaligned offset within a 16-aligned global, so blob+1 is never a
+	// multiple of 4. Static init means it's present at load, before main runs.
+	const val = 287454020 // 0x11223344
+	bin := compileTarget(t, `
+#include <unistd.h>
+volatile unsigned char blob[32] __attribute__((aligned(16))) =
+    {0, 0x44, 0x33, 0x22, 0x11};
+int main(void) {
+    for (;;) { sleep(1); (void)blob[0]; }
+    return 0;
+}
+`)
+	proc, err := memory.Launch(bin)
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied") {
+			t.Skipf("ptrace not permitted here: %v", err)
+		}
+		t.Fatalf("launch: %v", err)
+	}
+	defer func() {
+		proc.Close()
+		if p, err := os.FindProcess(proc.Pid); err == nil {
+			_ = p.Kill()
+			_, _ = p.Wait()
+		}
+	}()
+
+	// Byte-granular scan finds the unaligned value.
+	byteScan := NewScanner(proc, I32)
+	byteScan.Align = 1
+	if err := byteScan.Scan(Cond{Op: Equal, Value: val}); err != nil {
+		t.Fatalf("byte scan: %v", err)
+	}
+	c1 := len(byteScan.Matches)
+
+	// Type-width alignment (the fast default) steps by 4 and skips it.
+	alignedScan := NewScanner(proc, I32) // Align 0 -> type width (4)
+	if alignedScan.Alignment() != 4 {
+		t.Fatalf("default alignment = %d, want 4", alignedScan.Alignment())
+	}
+	if err := alignedScan.Scan(Cond{Op: Equal, Value: val}); err != nil {
+		t.Fatalf("aligned scan: %v", err)
+	}
+	c2 := len(alignedScan.Matches)
+
+	if c1 < 1 {
+		t.Fatal("byte-granular scan should find the unaligned value")
+	}
+	if c1 <= c2 {
+		t.Errorf("byte scan found %d, aligned scan found %d; alignment should skip the unaligned value", c1, c2)
 	}
 }
 

@@ -221,6 +221,39 @@ func TestHistorySkipsConsecutiveDuplicates(t *testing.T) {
 	}
 }
 
+func TestAlignCommandAndStatus(t *testing.T) {
+	m := newTestModel()
+	// :align 1 issues a worker command.
+	m = typeString(m, ":align 1")
+	nm, cmd := m.Update(press("enter"))
+	m = nm.(model)
+	if cmd == nil {
+		t.Error(":align 1 should issue a command")
+	}
+	// A bad alignment argument is reported, not sent.
+	m = typeString(m, ":align nope")
+	nm, cmd = m.Update(press("enter"))
+	m = nm.(model)
+	if cmd != nil {
+		t.Error(":align nope should not issue a command")
+	}
+	if m.errMsg == "" {
+		t.Error(":align nope should set an error")
+	}
+
+	// Status shows the alignment from state.
+	m2, _ := m.Update(stateMsg(state{Attached: true, Pid: 1, Type: scan.I32, Align: 4}))
+	m = m2.(model)
+	if !strings.Contains(m.View(), "align 4") {
+		t.Error("status should show the numeric alignment")
+	}
+	m2, _ = m.Update(stateMsg(state{Attached: true, Pid: 1, Type: scan.I32, Align: 0}))
+	m = m2.(model)
+	if !strings.Contains(m.View(), "align type") {
+		t.Error("status should show 'align type' for the default")
+	}
+}
+
 func TestFreezeKeyIssuesCommand(t *testing.T) {
 	m := newTestModel()
 	m2, _ := m.Update(stateMsg(state{

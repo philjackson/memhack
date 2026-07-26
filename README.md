@@ -77,8 +77,13 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
   Frozen rows are marked `*`; the status bar shows how many are frozen. Set a new
   value first (edit it), then freeze, to pin an arbitrary value. `:unfreeze`
   clears all freezes.
+- **Scan alignment**: by default the initial scan steps by the type width
+  (e.g. 4 for `i32`), which is much faster and finds naturally-aligned values.
+  Use `:align 1` (or `-align 1`) for an exhaustive every-byte scan that also
+  catches unaligned values, `:align type` to go back. The status bar shows the
+  current alignment.
 - **`:` commands**: `:pid N`, `:run prog args`, `:type f32`, `:set N value`,
-  `:setall value`, `:freeze N`, `:unfreeze`, `:reset`, `:undo`, `:q`.
+  `:setall value`, `:freeze N`, `:unfreeze`, `:align N`, `:reset`, `:undo`, `:q`.
 - **Ctrl+Z** undo, **Ctrl+R** reset. **Quit** with `quit` (or `:q`), **Ctrl+C**, or **Ctrl+D**.
 - While a scan or write is running, an animated spinner (`⣾ working…`) shows in
   the status bar; it appears only while work is in flight.
@@ -139,8 +144,10 @@ back to the previous match set (up to 16 steps).
   stop that only the tracer can clear, so a continuously-attached scanner
   intermittently *freezes* signal-heavy targets (games under Wine/Proton are a
   classic case). Attaching per-operation avoids that entirely.
-- The initial scan sweeps memory with 1-byte granularity (so unaligned values are
-  found); later scans only re-check the surviving match addresses, which is why they're fast.
+- The initial scan sweeps memory stepping by the scan alignment (the type width
+  by default, so it checks a quarter of the offsets for an `i32` — set `-align 1`
+  to check every byte and catch unaligned values); later scans only re-check the
+  surviving match addresses, which is why they're fast.
 - **Threading.** `ptrace` binds the tracer to a single OS thread, so all
   process access runs on one dedicated, `LockOSThread`-pinned goroutine — the
   synchronous REPL goroutine in `-repl` mode, or a background **worker** in the
@@ -181,7 +188,6 @@ internal/scan/scanner.go   scan + narrow + write engine
 This is an early scaffold. Natural next steps:
 
 - Regex / wildcard byte-pattern scanning, and unknown-initial-value scans.
-- Alignment option (align scans to the type width for speed).
 - Disassembly / pointer-map following.
 
 ## License

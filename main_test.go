@@ -41,6 +41,29 @@ func TestParseScanBytesAndString(t *testing.T) {
 	}
 }
 
+func TestParseAlign(t *testing.T) {
+	cases := map[string]int{
+		"type": 0, "auto": 0, "0": 0,
+		"byte": 1, "none": 1, "1": 1,
+		"4": 4, "8": 8,
+	}
+	for in, want := range cases {
+		got, err := parseAlign(in)
+		if err != nil {
+			t.Errorf("parseAlign(%q): %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("parseAlign(%q) = %d, want %d", in, got, want)
+		}
+	}
+	for _, in := range []string{"nope", "-2", "3.5"} {
+		if _, err := parseAlign(in); err == nil {
+			t.Errorf("parseAlign(%q): expected error", in)
+		}
+	}
+}
+
 func TestParseScan(t *testing.T) {
 	tests := []struct {
 		in        string

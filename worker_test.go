@@ -61,7 +61,7 @@ func run(t *testing.T, cmd tea.Cmd) state {
 
 func TestControllerLaunchScanWriteUndo(t *testing.T) {
 	bin := buildCTarget(t)
-	ctrl := newController(scan.I32, 0)
+	ctrl := newController(scan.I32, 0, 0)
 
 	st := run(t, ctrl.launch([]string{bin}))
 	if st.Err != nil {
@@ -195,7 +195,7 @@ func TestFreezeRewritesValue(t *testing.T) {
 
 func TestControllerFreezeState(t *testing.T) {
 	bin := buildCTarget(t)
-	ctrl := newController(scan.I32, time.Hour) // slow freeze; no interference
+	ctrl := newController(scan.I32, time.Hour, 0) // slow freeze; no interference
 	st := run(t, ctrl.launch([]string{bin}))
 	if st.Err != nil {
 		if strings.Contains(st.Err.Error(), "not permitted") || strings.Contains(st.Err.Error(), "denied") {
@@ -229,7 +229,7 @@ func TestControllerFreezeState(t *testing.T) {
 }
 
 func TestControllerScanBeforeAttach(t *testing.T) {
-	ctrl := newController(scan.I32, 0)
+	ctrl := newController(scan.I32, 0, 0)
 	st := run(t, ctrl.scanExpr("1"))
 	if st.Err == nil {
 		t.Fatal("expected an error scanning before attaching")
@@ -237,7 +237,7 @@ func TestControllerScanBeforeAttach(t *testing.T) {
 }
 
 func TestControllerSetType(t *testing.T) {
-	ctrl := newController(scan.I32, 0)
+	ctrl := newController(scan.I32, 0, 0)
 	st := run(t, ctrl.setType("f32"))
 	if st.Err != nil {
 		t.Fatalf("setType: %v", st.Err)

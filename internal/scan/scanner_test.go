@@ -45,6 +45,26 @@ func TestUndoMechanics(t *testing.T) {
 	}
 }
 
+func TestScannerAlignment(t *testing.T) {
+	s := &Scanner{Type: I32}
+	if got := s.Alignment(); got != 4 {
+		t.Errorf("default i32 alignment = %d, want 4 (type width)", got)
+	}
+	s.Align = 1
+	if got := s.Alignment(); got != 1 {
+		t.Errorf("Align=1 alignment = %d, want 1", got)
+	}
+	s.Align = 8
+	if got := s.Alignment(); got != 8 {
+		t.Errorf("Align=8 alignment = %d, want 8", got)
+	}
+	// Variable-width types (Size 0) fall back to 1.
+	b := &Scanner{Type: Bytes}
+	if got := b.Alignment(); got != 1 {
+		t.Errorf("bytes alignment = %d, want 1", got)
+	}
+}
+
 func TestUndoHistoryCap(t *testing.T) {
 	s := &Scanner{Type: I32}
 	for i := 0; i < maxHistory+10; i++ {

@@ -129,11 +129,28 @@ type Scanner struct {
 	Matches []Match
 	scanned bool
 	history []snapshot
+
+	// Align is the byte step used when sweeping memory in the first scan.
+	// 0 means "align to the type width" (fast, the default); 1 checks every
+	// byte offset (finds unaligned values, but is much slower); any N>1 steps
+	// by N. It only affects the initial numeric scan.
+	Align int
 }
 
 // NewScanner creates a scanner for the given process and data type.
 func NewScanner(proc *memory.Process, t DataType) *Scanner {
 	return &Scanner{proc: proc, Type: t}
+}
+
+// Alignment returns the effective scan step in bytes.
+func (s *Scanner) Alignment() int {
+	if s.Align >= 1 {
+		return s.Align
+	}
+	if w := s.Type.Size(); w >= 1 {
+		return w
+	}
+	return 1
 }
 
 // SetType changes the data type and resets any accumulated matches. Because a
@@ -224,6 +241,7 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 		return err
 	}
 	size := s.Type.Size()
+	step := s.Alignment()
 	var matches []Match
 	buf := make([]byte, chunkSize)
 
@@ -245,9 +263,16 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 				addr += uint64(n)
 				continue
 			}
-			// Slide over the readable bytes with 1-byte granularity so we
-			// find unaligned values, matching scanmem's default behaviour.
-			for off := 0; off+size <= got; off++ {
+			// Step by the alignment. The first offset is chosen so the
+			// absolute address addr+off is a multiple of step (step=1 checks
+			// every byte and finds unaligned values).
+			start := 0
+			if step > 1 {
+				if rem := int(addr % uint64(step)); rem != 0 {
+					start = step - rem
+				}
+			}
+			for off := start; off+size <= got; off += step {
 				cur, ok := s.Type.Decode(buf[off : off+size])
 				if !ok {
 					continue
