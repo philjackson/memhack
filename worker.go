@@ -57,6 +57,9 @@ type stateMsg state
 // readable rather than being wiped by the next refresh tick.
 type refreshMsg state
 
+// progressMsg reports how far the running scan has got.
+type progressMsg scan.Progress
+
 // job is a unit of work run on the worker's locked thread.
 type job struct {
 	run   func(*worker) (string, error)
@@ -79,12 +82,29 @@ type worker struct {
 
 	// align is the scan step applied to new scanners (0 = align to type width).
 	align int
+
+	// prog carries scan progress to the UI. Sends are non-blocking, so a UI
+	// that is slow to drain never holds up a scan (and with it the target).
+	prog chan scan.Progress
+}
+
+// sendProgress forwards a scan progress update, dropping it if the previous one
+// has not been picked up yet. Updates arrive far faster than the UI can redraw
+// and progress is monotonic, so dropping costs nothing but a slightly stale bar.
+func (w *worker) sendProgress(p scan.Progress) {
+	select {
+	case w.prog <- p:
+	default:
+	}
 }
 
 // controller is the UI-facing handle to the worker. Its methods return
 // tea.Cmds that submit a job and deliver the resulting state as a stateMsg.
 type controller struct {
 	jobs chan job
+
+	// prog receives scan progress updates for the UI to display.
+	prog chan scan.Progress
 
 	// scanCancel cancels the scan currently running (if any). It is set when a
 	// scan starts and cleared when it finishes; guarded by mu because it is
@@ -110,9 +130,19 @@ func newController(initial scan.DataType, freezeEvery time.Duration, align int) 
 		frozen:      map[uint64][]byte{},
 		freezeEvery: freezeEvery,
 		align:       align,
+		prog:        make(chan scan.Progress, 1),
 	}
 	go w.loop()
-	return &controller{jobs: w.jobs}
+	return &controller{jobs: w.jobs, prog: w.prog}
+}
+
+// waitProgress blocks until the next scan progress update arrives. The UI
+// re-issues it after each update to keep listening.
+func (c *controller) waitProgress() tea.Cmd {
+	if c.prog == nil {
+		return nil
+	}
+	return func() tea.Msg { return progressMsg(<-c.prog) }
 }
 
 // CancelScan aborts the scan in progress, if one is running.
@@ -299,8 +329,7 @@ func (w *worker) attach(pid int) (string, error) {
 	proc.Detach()
 
 	w.proc = proc
-	w.sc = scan.NewScanner(proc, w.dt)
-	w.sc.Align = w.align
+	w.sc = w.newScanner(proc)
 	return fmt.Sprintf("attached to pid %d", pid), nil
 }
 
@@ -320,9 +349,19 @@ func (w *worker) launch(argv []string) (string, error) {
 	proc.Detach()
 
 	w.proc = proc
-	w.sc = scan.NewScanner(proc, w.dt)
-	w.sc.Align = w.align
+	w.sc = w.newScanner(proc)
 	return fmt.Sprintf("launched %s as pid %d", argv[0], proc.Pid), nil
+}
+
+// newScanner builds a scanner for proc with the worker's current settings and
+// progress reporting wired up.
+func (w *worker) newScanner(proc *memory.Process) *scan.Scanner {
+	sc := scan.NewScanner(proc, w.dt)
+	sc.Align = w.align
+	if w.prog != nil {
+		sc.Progress = w.sendProgress
+	}
+	return sc
 }
 
 func (w *worker) detach() {

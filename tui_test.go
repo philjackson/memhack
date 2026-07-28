@@ -6,6 +6,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/phil/memhack/internal/scan"
 )
@@ -25,7 +26,7 @@ func assertQuit(t *testing.T, cmd tea.Cmd) {
 // executed. UI transition tests only inspect the returned model; they do not
 // run the returned tea.Cmds, so no worker interaction happens.
 func newTestModel() model {
-	ctrl := &controller{jobs: make(chan job)}
+	ctrl := &controller{jobs: make(chan job), prog: make(chan scan.Progress, 1)}
 	m := newModel(ctrl, scan.I32, nil, screenScanner, 0)
 	// Give it a size so the table/input are laid out.
 	m2, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
@@ -81,7 +82,7 @@ func TestSpinnerBusyEdge(t *testing.T) {
 		t.Fatal("should start idle")
 	}
 	// Idle -> busy edge returns a spinner start command.
-	cmd := m.markBusy()
+	cmd := m.markBusy("working")
 	if cmd == nil {
 		t.Fatal("markBusy on the idle->busy edge should return a start command")
 	}
@@ -89,7 +90,7 @@ func TestSpinnerBusyEdge(t *testing.T) {
 		t.Fatal("markBusy should set busy")
 	}
 	// Already busy -> no second start command (prevents duplicate tick loops).
-	if again := m.markBusy(); again != nil {
+	if again := m.markBusy("working"); again != nil {
 		t.Error("markBusy while busy should return nil")
 	}
 }
@@ -112,6 +113,183 @@ func TestStatusShowsWorkingWhenBusy(t *testing.T) {
 	m.busy = true
 	if !strings.Contains(m.View(), "working") {
 		t.Error("busy view should show the working indicator")
+	}
+}
+
+func TestBusyBoxAppearsOnlyAfterTheDelay(t *testing.T) {
+	m := newTestModel()
+	m.st = state{Attached: true, Pid: 1, Type: scan.I32}
+
+	cmd := m.markBusy("working")
+	if cmd == nil {
+		t.Fatal("markBusy should start the spinner")
+	}
+	// Just-issued work shows the status-line spinner but no centred box, so a
+	// fast action never flashes one up.
+	if m.showBusyBox() {
+		t.Error("the box should not appear before the delay has elapsed")
+	}
+	m.busySince = m.busySince.Add(-busyOverlayDelay)
+	if !m.showBusyBox() {
+		t.Fatal("the box should appear once the work outlives the delay")
+	}
+	if !strings.Contains(m.View(), "working…") {
+		t.Error("the busy view should contain the progress box")
+	}
+	m.clearBusy()
+	if m.showBusyBox() || m.busy {
+		t.Error("clearBusy should remove the box")
+	}
+}
+
+func TestBusyBoxHiddenForLiveWatchRefresh(t *testing.T) {
+	m := newTestModel()
+	// The watch marks the model busy with no label; however long it takes, it
+	// must not throw a box over the screen every interval.
+	m.markBusy("")
+	m.busySince = m.busySince.Add(-10 * busyOverlayDelay)
+	if m.showBusyBox() {
+		t.Error("the live watch refresh must not draw the progress box")
+	}
+}
+
+func TestBusyBoxNamesAndCancelsAScan(t *testing.T) {
+	m := newTestModel()
+	m.markBusy("working")
+	m.busySince = m.busySince.Add(-busyOverlayDelay)
+	// A scan in flight is named as such and advertises how to cancel it.
+	m.ctrl.scanCancel = func() {}
+	box := m.busyBox()
+	if !strings.Contains(box, "scanning") {
+		t.Errorf("box should name the scan: %q", box)
+	}
+	if !strings.Contains(box, "esc: cancel") {
+		t.Errorf("box should offer cancellation: %q", box)
+	}
+
+	// Once cancelled, the box reports the wind-down instead of repeating the
+	// cancel hint.
+	nm, _ := m.Update(press("esc"))
+	m = nm.(model)
+	box = m.busyBox()
+	if !strings.Contains(box, "cancelling scan") || strings.Contains(box, "esc: cancel") {
+		t.Errorf("box should report cancelling: %q", box)
+	}
+}
+
+func TestWatchRefreshDoesNotClearAPendingAction(t *testing.T) {
+	m := newTestModel()
+	// A refresh is in flight when the user issues an action: the worker replies
+	// to the refresh first, and that must not stop the action's indicator.
+	m.markBusy("")
+	m.markBusy("working")
+	nm, _ := m.Update(refreshMsg{Attached: true})
+	m = nm.(model)
+	if !m.busy || m.busyLabel == "" {
+		t.Error("a refresh reply should leave a pending action's indicator up")
+	}
+	// The action's own reply clears it.
+	nm, _ = m.Update(stateMsg{Attached: true})
+	m = nm.(model)
+	if m.busy || m.busyLabel != "" {
+		t.Error("the action's reply should clear the indicator")
+	}
+}
+
+func TestScanProgressDrivesTheBar(t *testing.T) {
+	m := newTestModel()
+	m.markBusy(busyWorking)
+	m.busySince = m.busySince.Add(-busyOverlayDelay)
+
+	// Before any update the work is indeterminate: spinner only, no bar.
+	if strings.Contains(m.busyBox(), "%") {
+		t.Error("box should not show a percentage before progress is known")
+	}
+
+	nm, cmd := m.Update(progressMsg{Done: 512 << 20, Total: 1 << 30, Unit: scan.UnitBytes})
+	m = nm.(model)
+	if cmd == nil {
+		t.Error("a progress update must re-arm the listener for the next one")
+	}
+	box := m.busyBox()
+	if !strings.Contains(box, "50%") {
+		t.Errorf("box should show the percentage: %q", box)
+	}
+	if !strings.Contains(box, "512.0 MiB of 1.0 GiB") {
+		t.Errorf("box should show the byte counters: %q", box)
+	}
+
+	// Finishing the work drops the bar with it.
+	nm, _ = m.Update(stateMsg{Attached: true})
+	m = nm.(model)
+	if m.scanProg.Total != 0 {
+		t.Error("completing the work should discard its progress")
+	}
+}
+
+func TestProgressUpdateIgnoredWhenIdle(t *testing.T) {
+	m := newTestModel()
+	// A last update landing after the scan's reply must not leave a stale bar
+	// for whatever is issued next.
+	nm, cmd := m.Update(progressMsg{Done: 10, Total: 10, Unit: scan.UnitMatches})
+	m = nm.(model)
+	if m.scanProg.Total != 0 {
+		t.Error("progress arriving while idle should be dropped")
+	}
+	if cmd == nil {
+		t.Error("the listener must stay armed even for a dropped update")
+	}
+}
+
+func TestProgressResetBetweenActions(t *testing.T) {
+	m := newTestModel()
+	m.markBusy(busyWorking)
+	m.scanProg = scan.Progress{Done: 9, Total: 10, Unit: scan.UnitMatches}
+	m.clearBusy()
+
+	// A new action starts from an empty bar rather than the last one's.
+	m.markBusy(busyWorking)
+	if m.scanProg.Total != 0 {
+		t.Error("a new action should not inherit the previous one's progress")
+	}
+
+	// Same when an action takes over from an in-flight watch refresh.
+	m.clearBusy()
+	m.markBusy("")
+	m.scanProg = scan.Progress{Done: 9, Total: 10, Unit: scan.UnitMatches}
+	m.markBusy(busyWorking)
+	if m.scanProg.Total != 0 {
+		t.Error("taking over from a refresh should reset progress")
+	}
+}
+
+func TestFormatProgressUnits(t *testing.T) {
+	byteProg := scan.Progress{Done: 3 << 30, Total: 8 << 30, Unit: scan.UnitBytes}
+	if got, want := formatProgress(byteProg), "3.0 GiB of 8.0 GiB"; got != want {
+		t.Errorf("formatProgress(bytes) = %q, want %q", got, want)
+	}
+	matchProg := scan.Progress{Done: 4096, Total: 12345, Unit: scan.UnitMatches}
+	if got, want := formatProgress(matchProg), "4096 of 12345 matches"; got != want {
+		t.Errorf("formatProgress(matches) = %q, want %q", got, want)
+	}
+}
+
+func TestBusyBoxFitsNarrowTerminals(t *testing.T) {
+	m := newTestModel()
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 30, Height: 20})
+	m = nm.(model)
+	m.markBusy(busyWorking)
+	m.busySince = m.busySince.Add(-busyOverlayDelay)
+	m.scanProg = scan.Progress{Done: 1, Total: 4, Unit: scan.UnitBytes}
+
+	for i, line := range strings.Split(m.busyBox(), "\n") {
+		if w := ansi.StringWidth(line); w > 30 {
+			t.Errorf("box line %d is %d cells wide, past the 30-cell terminal", i, w)
+		}
+	}
+	// It must still be composited (i.e. actually fit) rather than dropped.
+	if !strings.Contains(m.View(), "%") {
+		t.Error("the box should still be shown on a narrow terminal")
 	}
 }
 

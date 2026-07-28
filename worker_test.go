@@ -250,3 +250,54 @@ func TestControllerSetType(t *testing.T) {
 		t.Error("expected error for bogus type")
 	}
 }
+
+func TestSendProgressNeverBlocksTheScan(t *testing.T) {
+	w := &worker{prog: make(chan scan.Progress, 1)}
+
+	// A scan reports far faster than the UI redraws. Sends past the buffer are
+	// dropped rather than stalling the scan (which holds the target stopped).
+	done := make(chan struct{})
+	go func() {
+		for i := uint64(0); i < 1000; i++ {
+			w.sendProgress(scan.Progress{Done: i, Total: 1000, Unit: scan.UnitBytes})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sendProgress blocked when nobody was draining the channel")
+	}
+
+	// The update that was buffered is still there for the UI to pick up.
+	select {
+	case p := <-w.prog:
+		if p.Total != 1000 {
+			t.Errorf("buffered update = %+v, want Total 1000", p)
+		}
+	default:
+		t.Error("expected one buffered progress update")
+	}
+}
+
+func TestWaitProgressDeliversAnUpdate(t *testing.T) {
+	ctrl := newController(scan.I32, time.Hour, 0)
+	cmd := ctrl.waitProgress()
+	if cmd == nil {
+		t.Fatal("a controller with a progress channel should return a listener")
+	}
+	ctrl.prog <- scan.Progress{Done: 3, Total: 4, Unit: scan.UnitMatches}
+	msg, ok := cmd().(progressMsg)
+	if !ok {
+		t.Fatalf("waitProgress produced %T, want progressMsg", msg)
+	}
+	if msg.Done != 3 || msg.Total != 4 || msg.Unit != scan.UnitMatches {
+		t.Errorf("delivered %+v, want 3/4 matches", msg)
+	}
+
+	// A controller built without one (as the UI tests do) must not hand back a
+	// listener that would block forever.
+	if (&controller{}).waitProgress() != nil {
+		t.Error("waitProgress without a channel should return nil")
+	}
+}

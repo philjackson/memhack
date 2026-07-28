@@ -122,6 +122,37 @@ type snapshot struct {
 	scanned bool
 }
 
+// Units a Progress can be measured in.
+const (
+	UnitBytes   = "bytes"   // an initial sweep, measured over scannable memory
+	UnitMatches = "matches" // a narrowing scan, measured over the match set
+)
+
+// Progress reports how far a scan has got: Done out of Total units of Unit.
+// An initial sweep counts bytes of scannable memory; a narrowing scan counts
+// matches re-checked.
+type Progress struct {
+	Done  uint64
+	Total uint64
+	Unit  string
+}
+
+// Fraction returns how much of the scan is complete, in [0,1]. It is 0 when
+// the total is unknown.
+func (p Progress) Fraction() float64 {
+	if p.Total == 0 {
+		return 0
+	}
+	if p.Done >= p.Total {
+		return 1
+	}
+	return float64(p.Done) / float64(p.Total)
+}
+
+// progressEvery is how many matches a narrowing scan re-checks between progress
+// reports. It matches the cancellation check so both share one branch.
+const progressEvery = 4096
+
 // Scanner holds scan state for one attached process and data type.
 type Scanner struct {
 	proc    *memory.Process
@@ -129,6 +160,11 @@ type Scanner struct {
 	Matches []Match
 	scanned bool
 	history []snapshot
+
+	// Progress, if set, is called periodically during a scan with how far it
+	// has got. It runs on the scanning goroutine, so it must not block: a slow
+	// callback slows the scan (and holds the target stopped for longer).
+	Progress func(Progress)
 
 	// Align is the byte step used when sweeping memory in the first scan.
 	// 0 means "align to the type width" (fast, the default); 1 checks every
@@ -198,6 +234,25 @@ func (s *Scanner) pushHistory() {
 // chunkSize bounds how much we read from a region at once.
 const chunkSize = 1 << 20 // 1 MiB
 
+// report passes a progress update to the installed callback, if any.
+func (s *Scanner) report(done, total uint64, unit string) {
+	if s.Progress != nil {
+		s.Progress(Progress{Done: done, Total: total, Unit: unit})
+	}
+}
+
+// scannableBytes totals the size of the regions a sweep will read, giving the
+// denominator for byte-measured progress.
+func scannableBytes(regions []memory.Region) uint64 {
+	var total uint64
+	for _, r := range regions {
+		if r.Scannable() {
+			total += r.Size()
+		}
+	}
+	return total
+}
+
 // Scan runs a scan with the given condition. It is equivalent to ScanContext
 // with a background (never-cancelled) context.
 func (s *Scanner) Scan(c Cond) error { return s.ScanContext(context.Background(), c) }
@@ -245,6 +300,11 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 	var matches []Match
 	buf := make([]byte, chunkSize)
 
+	// Progress is measured in bytes of scannable memory: the regions already
+	// finished (swept) plus how far into the current one we are.
+	total := scannableBytes(regions)
+	var swept uint64
+
 	for _, r := range regions {
 		if !r.Scannable() {
 			continue
@@ -253,6 +313,7 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 			if ctx.Err() != nil {
 				return ErrCancelled
 			}
+			s.report(swept+(addr-r.Start), total, UnitBytes)
 			n := chunkSize
 			if remain := r.End - addr; uint64(n) > remain {
 				n = int(remain)
@@ -285,7 +346,9 @@ func (s *Scanner) first(ctx context.Context, c Cond) error {
 			}
 			addr += uint64(got)
 		}
+		swept += r.Size()
 	}
+	s.report(total, total, UnitBytes)
 	s.Matches = matches
 	s.scanned = true
 	return nil
@@ -306,11 +369,15 @@ func (s *Scanner) narrow(ctx context.Context, c Cond) error {
 	// is retained in the undo history and must not be overwritten.
 	var kept []Match
 
+	total := uint64(len(s.Matches))
 	for i, m := range s.Matches {
-		// Check for cancellation periodically (not every iteration, to keep
-		// the hot loop tight).
-		if i%4096 == 0 && ctx.Err() != nil {
-			return ErrCancelled
+		// Check for cancellation and report progress periodically (not every
+		// iteration, to keep the hot loop tight).
+		if i%progressEvery == 0 {
+			if ctx.Err() != nil {
+				return ErrCancelled
+			}
+			s.report(uint64(i), total, UnitMatches)
 		}
 		got, err := s.proc.ReadAt(buf, m.Addr)
 		if err != nil || got < size {
@@ -328,6 +395,7 @@ func (s *Scanner) narrow(ctx context.Context, c Cond) error {
 		copy(last, buf)
 		kept = append(kept, Match{Addr: m.Addr, Last: last})
 	}
+	s.report(total, total, UnitMatches)
 	s.Matches = kept
 	return nil
 }
@@ -350,6 +418,9 @@ func (s *Scanner) firstBytes(ctx context.Context, c Cond) error {
 	var matches []Match
 	buf := make([]byte, chunkSize)
 
+	total := scannableBytes(regions)
+	var swept uint64
+
 	for _, r := range regions {
 		if !r.Scannable() {
 			continue
@@ -358,6 +429,7 @@ func (s *Scanner) firstBytes(ctx context.Context, c Cond) error {
 			if ctx.Err() != nil {
 				return ErrCancelled
 			}
+			s.report(swept+(addr-r.Start), total, UnitBytes)
 			n := chunkSize
 			if remain := r.End - addr; uint64(n) > remain {
 				n = int(remain)
@@ -376,7 +448,9 @@ func (s *Scanner) firstBytes(ctx context.Context, c Cond) error {
 			}
 			addr += uint64(got)
 		}
+		swept += r.Size()
 	}
+	s.report(total, total, UnitBytes)
 	s.Matches = matches
 	s.scanned = true
 	return nil
@@ -392,9 +466,13 @@ func (s *Scanner) narrowBytes(ctx context.Context, c Cond) error {
 	defer s.proc.Detach()
 	var kept []Match
 
+	total := uint64(len(s.Matches))
 	for i, m := range s.Matches {
-		if i%4096 == 0 && ctx.Err() != nil {
-			return ErrCancelled
+		if i%progressEvery == 0 {
+			if ctx.Err() != nil {
+				return ErrCancelled
+			}
+			s.report(uint64(i), total, UnitMatches)
 		}
 		w := len(m.Last)
 		if c.Op == Equal || c.Op == NotEqual {
@@ -416,6 +494,7 @@ func (s *Scanner) narrowBytes(ctx context.Context, c Cond) error {
 		copy(last, cur)
 		kept = append(kept, Match{Addr: m.Addr, Last: last})
 	}
+	s.report(total, total, UnitMatches)
 	s.Matches = kept
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -23,6 +24,20 @@ const (
 	// unintrusive (especially for large, multithreaded targets).
 	defaultWatchInterval = 1 * time.Second
 	scanPrompt           = "scan› "
+
+	// busyOverlayDelay is how long a request must be in flight before the
+	// centred progress box appears. Quick actions (writes, freezes, a type
+	// change) finish well inside it, so the box never flashes for them; only
+	// work slow enough to look like a hang draws it.
+	busyOverlayDelay = 250 * time.Millisecond
+
+	// Labels for in-flight work, shown in the progress box.
+	busyWorking    = "working"
+	busyCancelling = "cancelling scan"
+
+	// busyBoxWidth is the inner width of the progress box, in cells. It is
+	// narrowed to fit when the terminal is too small for it.
+	busyBoxWidth = 38
 )
 
 // inputMode selects how the text input's contents are interpreted on Enter.
@@ -50,6 +65,10 @@ var (
 	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+
+	// Styles for the centred progress box.
+	busyBoxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("57")).Padding(0, 2)
+	busyLabelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229"))
 )
 
 type model struct {
@@ -58,6 +77,7 @@ type model struct {
 	input textinput.Model
 	table table.Model
 	spin  spinner.Model
+	bar   progress.Model
 	list  list.Model
 
 	screen        screen
@@ -68,6 +88,9 @@ type model struct {
 	writeIdx   int
 	focusTable bool
 	busy       bool
+	busyLabel  string        // what the in-flight work is called; "" = show no overlay
+	busySince  time.Time     // when the current busy stretch began
+	scanProg   scan.Progress // how far the running scan has got (zero Total = unknown)
 	status     string
 	errMsg     string
 	lastScan   string   // last scan expression, for instant repeat
@@ -107,11 +130,16 @@ func newModel(ctrl *controller, dt scan.DataType, startup tea.Cmd, start screen,
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 
+	// ViewAs renders the bar straight from a fraction, so the progress model
+	// needs no animation frames of its own.
+	bar := progress.New(progress.WithDefaultGradient(), progress.WithWidth(busyBoxWidth))
+
 	return model{
 		ctrl:          ctrl,
 		input:         ti,
 		table:         tbl,
 		spin:          sp,
+		bar:           bar,
 		list:          newProcList(),
 		screen:        start,
 		mode:          modeScan,
@@ -127,6 +155,9 @@ func tickCmd(d time.Duration) tea.Cmd {
 
 func (m model) Init() tea.Cmd {
 	cmds := []tea.Cmd{textinput.Blink, tickCmd(m.watchInterval)}
+	if c := m.ctrl.waitProgress(); c != nil {
+		cmds = append(cmds, c)
+	}
 	if m.startup != nil {
 		cmds = append(cmds, m.startup)
 	}
@@ -157,9 +188,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// are matches to read. Each refresh attaches, reads, and detaches, so
 		// while paused (or matchless) the target is never touched.
 		if !m.watchPaused && !m.busy && m.st.Attached && m.st.Count > 0 {
-			cmds = append(cmds, m.markBusy(), m.ctrl.refresh())
+			// No label: the watch fires every interval, so it animates the
+			// status-line spinner but never draws the centred box.
+			cmds = append(cmds, m.markBusy(""), m.ctrl.refresh())
 		}
 		return m, tea.Batch(cmds...)
+
+	case progressMsg:
+		// Keep listening whatever we do with this update: the channel outlives
+		// any single scan.
+		cmd := m.ctrl.waitProgress()
+		// Updates that outlive their scan (a last one landing after the reply)
+		// would otherwise leave a stale bar behind for the next one.
+		if m.busy {
+			m.scanProg = scan.Progress(msg)
+		}
+		return m, cmd
 
 	case spinner.TickMsg:
 		// Keep the spinner animating only while a request is in flight; once
@@ -174,13 +218,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		// Live value refresh: update the data but keep the status/error line,
 		// so a prior action's message stays on screen instead of flashing away.
-		m.busy = false
+		// A labelled action issued while this refresh was in flight is still
+		// running behind it (the worker runs jobs one at a time), so leave the
+		// busy state to that action's reply rather than clearing it here.
+		if m.busyLabel == "" {
+			m.clearBusy()
+		}
 		m.st = state(msg)
 		m.refreshTable()
 		return m, nil
 
 	case stateMsg:
-		m.busy = false
+		m.clearBusy()
 		m.st = state(msg)
 		if m.st.Err != nil {
 			m.errMsg = m.st.Err.Error()
@@ -248,6 +297,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.busy && m.ctrl.ScanRunning() {
 			m.ctrl.CancelScan()
 			m.status = "cancelling scan…"
+			// Say so in the progress box too: cancelling isn't instant, and the
+			// box is what the eye is on while the scan winds down.
+			m.busyLabel = busyCancelling
 		}
 		return m, nil
 	}
@@ -465,7 +517,7 @@ func (m model) issue(cmd tea.Cmd) (tea.Model, tea.Cmd) {
 	if cmd == nil {
 		return m, nil
 	}
-	return m, tea.Batch(cmd, m.markBusy())
+	return m, tea.Batch(cmd, m.markBusy(busyWorking))
 }
 
 // maxInputHistory bounds how many entered lines are remembered.
@@ -507,12 +559,33 @@ func (m *model) historyStep(dir int) {
 // markBusy flips the busy flag and, on the idle→busy edge, returns the command
 // that starts the spinner animation. It returns nil if already busy, so the
 // spinner's tick loop is never started twice concurrently.
-func (m *model) markBusy() tea.Cmd {
+//
+// label names the work for the centred progress box; "" means "show no box"
+// (used by the live watch, which is routine and shouldn't be announced).
+func (m *model) markBusy(label string) tea.Cmd {
 	if m.busy {
+		// An action issued while an unlabelled refresh is in flight takes over
+		// the indicator, timed from when the action itself started.
+		if label != "" && m.busyLabel == "" {
+			m.busyLabel = label
+			m.busySince = time.Now()
+			m.scanProg = scan.Progress{}
+		}
 		return nil
 	}
 	m.busy = true
+	m.busyLabel = label
+	m.busySince = time.Now()
+	m.scanProg = scan.Progress{}
 	return m.spin.Tick
+}
+
+// clearBusy marks the in-flight work as finished, which stops the spinner tick
+// loop and removes the progress box.
+func (m *model) clearBusy() {
+	m.busy = false
+	m.busyLabel = ""
+	m.scanProg = scan.Progress{}
 }
 
 func (m *model) toggleFocus() {
@@ -591,7 +664,7 @@ func (m *model) layout() {
 
 func (m model) View() string {
 	if m.screen == screenPicker {
-		return m.pickerView()
+		return m.overlay(m.pickerView())
 	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("memhack") + "  " + m.statusLine() + "\n\n")
@@ -608,7 +681,77 @@ func (m model) View() string {
 		b.WriteString("\n")
 	}
 	b.WriteString(helpStyle.Render(m.helpText()))
-	return b.String()
+	return m.overlay(b.String())
+}
+
+// overlay floats the progress box over the middle of the view while work that
+// is slow enough to notice is in flight. The status-line spinner covers the
+// short stretch before it appears.
+func (m model) overlay(view string) string {
+	if !m.showBusyBox() {
+		return view
+	}
+	return placeOverlayCenter(view, m.busyBox(), m.width)
+}
+
+// showBusyBox reports whether the centred progress box is due.
+func (m model) showBusyBox() bool {
+	return m.busy && m.busyLabel != "" && time.Since(m.busySince) >= busyOverlayDelay
+}
+
+// busyBox renders the centred progress box: a spinner, what is running, how far
+// it has got, how long it has been running, and how to stop it if it can be
+// stopped. A scan reports real progress, so it gets a bar; anything else is
+// quick and indeterminate, so it gets the spinner alone.
+func (m model) busyBox() string {
+	label, hint := m.busyLabel+"…", ""
+	if m.busyLabel == busyWorking && m.ctrl != nil && m.ctrl.ScanRunning() {
+		label, hint = "scanning memory…", "esc: cancel"
+	}
+	spin := m.spin.View() + " " + busyLabelStyle.Render(label)
+	elapsed := statusStyle.Render(fmt.Sprintf("%.1fs", time.Since(m.busySince).Seconds()))
+
+	// Without a bar there is nothing to line up with, so the box shrinks to its
+	// contents rather than sitting mostly empty.
+	p := m.scanProg
+	if p.Total == 0 {
+		body := spin + "  " + elapsed
+		if hint != "" {
+			body = lipgloss.JoinVertical(lipgloss.Center, body, helpStyle.Render(hint))
+		}
+		return busyBoxStyle.Render(body)
+	}
+
+	w := m.busyBoxWidth()
+	bar := m.bar
+	bar.Width = w
+	return busyBoxStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		padBetween(spin, elapsed, w),
+		bar.ViewAs(p.Fraction()),
+		padBetween(statusStyle.Render(formatProgress(p)), helpStyle.Render(hint), w),
+	))
+}
+
+// busyBoxWidth is the box's inner width, shrunk to fit a narrow terminal.
+func (m model) busyBoxWidth() int {
+	// The border and padding around the content cost 6 cells; leave a little
+	// air either side of the box.
+	if max := m.width - 10; m.width > 0 && max < busyBoxWidth {
+		if max < 12 {
+			return 12
+		}
+		return max
+	}
+	return busyBoxWidth
+}
+
+// formatProgress renders a progress update's counters, in whichever unit the
+// scan is measured in.
+func formatProgress(p scan.Progress) string {
+	if p.Unit == scan.UnitBytes {
+		return fmt.Sprintf("%s of %s", humanBytes(p.Done), humanBytes(p.Total))
+	}
+	return fmt.Sprintf("%d of %d %s", p.Done, p.Total, p.Unit)
 }
 
 // pickerView renders the process picker. The list component draws its own

@@ -371,3 +371,73 @@ func TestRelativeScanNeedsPrior(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+func TestScanReportsProgress(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	bin := buildTarget(t)
+	proc, err := memory.Launch(bin)
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied") {
+			t.Skipf("ptrace not permitted here: %v", err)
+		}
+		t.Fatalf("launch: %v", err)
+	}
+	defer func() {
+		proc.Close()
+		if p, err := os.FindProcess(proc.Pid); err == nil {
+			_ = p.Kill()
+			_, _ = p.Wait()
+		}
+	}()
+
+	s := NewScanner(proc, I32)
+	var got []Progress
+	s.Progress = func(p Progress) { got = append(got, p) }
+
+	// The initial sweep is measured in bytes of scannable memory.
+	if err := s.Scan(Cond{Op: Equal, Value: 1337}); err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	checkProgress(t, got, UnitBytes)
+
+	// Narrowing is measured in matches re-checked.
+	got = nil
+	if err := s.Scan(Cond{Op: Equal, Value: 1337}); err != nil {
+		t.Fatalf("narrow scan: %v", err)
+	}
+	checkProgress(t, got, UnitMatches)
+}
+
+// checkProgress asserts that a scan's updates are in the expected unit, never
+// go backwards or past the total, and finish at 100%.
+func checkProgress(t *testing.T, got []Progress, unit string) {
+	t.Helper()
+	if len(got) == 0 {
+		t.Fatalf("scan reported no progress at all")
+	}
+	var prev uint64
+	for i, p := range got {
+		if p.Unit != unit {
+			t.Errorf("update %d: unit = %q, want %q", i, p.Unit, unit)
+		}
+		if p.Total == 0 {
+			t.Errorf("update %d: total is 0, so the bar would have nothing to scale to", i)
+		}
+		if p.Done < prev {
+			t.Errorf("update %d: progress went backwards: %d after %d", i, p.Done, prev)
+		}
+		if p.Done > p.Total {
+			t.Errorf("update %d: done %d exceeds total %d", i, p.Done, p.Total)
+		}
+		if f := p.Fraction(); f < 0 || f > 1 {
+			t.Errorf("update %d: fraction %v out of range", i, f)
+		}
+		prev = p.Done
+	}
+	last := got[len(got)-1]
+	if last.Done != last.Total || last.Fraction() != 1 {
+		t.Errorf("a completed scan should end at 100%%: got %d of %d", last.Done, last.Total)
+	}
+}
