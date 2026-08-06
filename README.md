@@ -12,6 +12,9 @@ for debugging, reverse-engineering, or editing game values in a process you own.
 
 ![Picking a process to attach to](docs/picker.png)
 
+<img width="453" height="212" alt="image" src="https://github.com/user-attachments/assets/636658db-9689-4776-b0b2-c4a473bd87b5" />
+
+
 ## Building
 
 ```sh
