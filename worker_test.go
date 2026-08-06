@@ -137,7 +137,7 @@ func TestFreezeRewritesValue(t *testing.T) {
 	defer runtime.UnlockOSThread()
 
 	bin := buildCTarget(t)
-	w := &worker{dt: scan.I32, frozen: map[uint64][]byte{}, freezeEvery: time.Hour}
+	w := newWorker(scan.I32, time.Hour, 0)
 	if _, err := w.launch([]string{bin}); err != nil {
 		if strings.Contains(err.Error(), "not permitted") || strings.Contains(err.Error(), "denied") {
 			t.Skipf("ptrace not permitted here: %v", err)
@@ -156,7 +156,7 @@ func TestFreezeRewritesValue(t *testing.T) {
 	if _, err := w.scanExpr(context.Background(), "1337"); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	if len(w.sc.Matches) == 0 {
+	if len(w.active().sc.Matches) == 0 {
 		t.Fatal("expected a match for 1337")
 	}
 
@@ -172,15 +172,15 @@ func TestFreezeRewritesValue(t *testing.T) {
 	if _, err := w.write(0, "9999"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	w.sc.RefreshN(1)
-	if got := scan.I32.Format(w.sc.Matches[0].Last); got != "9999" {
+	w.active().sc.RefreshN(1)
+	if got := scan.I32.Format(w.active().sc.Matches[0].Last); got != "9999" {
 		t.Fatalf("write didn't take: value = %s", got)
 	}
 
 	// A freeze pass must restore the frozen value.
 	w.applyFreezes()
-	w.sc.RefreshN(1)
-	if got := scan.I32.Format(w.sc.Matches[0].Last); got != "1337" {
+	w.active().sc.RefreshN(1)
+	if got := scan.I32.Format(w.active().sc.Matches[0].Last); got != "1337" {
 		t.Errorf("freeze did not restore the value: got %s, want 1337", got)
 	}
 

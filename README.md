@@ -44,6 +44,7 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
 
 ```
 ┌ memhack   pid 12345 │ type i32 │ 3 matches ──────────────────┐
+│  1 1337 (3)   2 health (1)   3 empty      ctrl+t: new tab    │
 │  #    Address           Value                                │
 │  0    0x55c8e8e22030    1337       ← live-updating values     │
 │  1    0x7ffd672ddfa0    1337                                 │
@@ -54,6 +55,8 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
 └──────────────────────────────────────────────────────────────┘
 ```
 
+- **F1 (or `:help`) opens a scrollable reference** of every key and command,
+  so the interface documents itself.
 - **Type a scan expression** in the `scan›` line and press **Enter** to scan
   (first scan finds all matches; later scans narrow them). The same expressions
   as the CLI work: `1337`, `> 100`, `10..20`, `changed`, `inc`, `dec 5`, …
@@ -85,9 +88,27 @@ You can also attach from inside the TUI with `:pid 12345` or `:run ./mygame`.
   Use `:align 1` (or `-align 1`) for an exhaustive every-byte scan that also
   catches unaligned values, `:align type` to go back. The status bar shows the
   current alignment.
+- **Tabs — several searches at once.** Hunting for health *and* ammo *and* a
+  timer no longer means starting over each time: each tab is an independent
+  search of the same process, listed in the bar under the title with its match
+  count.
+  **Ctrl+T** opens one (inheriting the current type and alignment), **Ctrl+D**
+  (on an empty input, as in a shell) or **Alt+W** closes it, **Shift+Tab**
+  cycles, **Alt+←/→** move either way, and
+  **Alt+1 … Alt+9** jump straight to a tab. **F2** renames the current one
+  (empty clears the name again). Typed equivalents: `:tab`, `:tab new [name]`,
+  `:tab close`, `:tab rename <name>`, `:tab <n>`.
+  A tab keeps its own matches, undo history, data type and alignment, and is
+  labelled by its name or, failing that, its last scan. The target process and
+  its frozen addresses are shared, so a value frozen in one tab keeps being
+  held while you work in another. Attaching to a process clears every tab (an
+  address means nothing in a different process). Up to 9 tabs; closing one
+  releases its matches.
 - **`:` commands**: `:pid N`, `:run prog args`, `:type f32`, `:set N value`,
-  `:setall value`, `:freeze N`, `:unfreeze`, `:align N`, `:reset`, `:undo`, `:q`.
-- **Ctrl+Z** undo, **Ctrl+R** reset. **Quit** with `quit` (or `:q`), **Ctrl+C**, or **Ctrl+D**.
+  `:setall value`, `:freeze N`, `:unfreeze`, `:align N`, `:reset`, `:undo`,
+  `:tab …`, `:help`, `:q`.
+- **Ctrl+Z** undo, **Ctrl+R** reset. **Quit** with `quit` (or `:q`) or **Ctrl+C**
+  — Ctrl+D closes the current tab instead, and never the whole program.
 - While a scan or write is running, an animated spinner (`⣾ working…`) shows in
   the status bar; it appears only while work is in flight.
 
@@ -125,7 +146,14 @@ memhack[1]> set 0 9999      # write 9999 into match #0
 | `setall <value>` | Write `<value>` to every match |
 | `undo` | Revert the last scan, restoring the previous set of matches |
 | `reset` | Discard matches and start over |
+| `tab` | List the open searches (tabs) |
+| `tab new [name]` | Open another search, inheriting the current type/alignment |
+| `tab <n>` / `tab close` / `tab rename <name>` | Switch to, close, or name a tab |
 | `help`, `quit` | Help / exit |
+
+Tabs work the same as in the TUI: each keeps its own matches, undo history,
+type and alignment, while the target and its frozen addresses are shared. The
+prompt names the current tab once more than one is open — `memhack(2 ammo)[3]>`.
 
 A typical workflow: scan for a known value, let the program change it, scan with
 `inc`/`dec`/`changed`/`<`/`>`/`lo..hi` to narrow the candidates, repeat until one
@@ -173,9 +201,11 @@ Check your setting with `cat /proc/sys/kernel/yama/ptrace_scope`. A value of `1`
 
 ```
 main.go                    entry point, flags, REPL, scan-expression parsing
-tui.go                     Bubble Tea model: view, key handling, table + input
+tui.go                     Bubble Tea model: view, key handling, table + input,
+                           tab bar, help screen
+tabs.go                    tabs: one independent search each, shared by both UIs
 procpicker.go              startup process picker (searchable list) 
-worker.go                  thread-locked worker owning the process/scanner;
+worker.go                  thread-locked worker owning the process and tabs;
                            controller exposing it to the TUI as tea.Cmds
 internal/memory/proclist.go  /proc enumeration for the picker
 internal/memory/maps.go    /proc/<pid>/maps parsing

@@ -39,13 +39,34 @@ func press(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case "tab":
 		return tea.KeyMsg{Type: tea.KeyTab}
+	case "shift+tab":
+		return tea.KeyMsg{Type: tea.KeyShiftTab}
 	case "esc":
 		return tea.KeyMsg{Type: tea.KeyEsc}
 	case "ctrl+z":
 		return tea.KeyMsg{Type: tea.KeyCtrlZ}
 	case "ctrl+c":
 		return tea.KeyMsg{Type: tea.KeyCtrlC}
+	case "ctrl+d":
+		return tea.KeyMsg{Type: tea.KeyCtrlD}
+	case "ctrl+t":
+		return tea.KeyMsg{Type: tea.KeyCtrlT}
+	case "f1":
+		return tea.KeyMsg{Type: tea.KeyF1}
+	case "f2":
+		return tea.KeyMsg{Type: tea.KeyF2}
+	case "alt+left":
+		return tea.KeyMsg{Type: tea.KeyLeft, Alt: true}
+	case "alt+right":
+		return tea.KeyMsg{Type: tea.KeyRight, Alt: true}
 	}
+	// alt+<rune> (alt+w, alt+1, …) needs the real modifier: some handlers look
+	// past String() at the rune itself.
+	if rest, ok := strings.CutPrefix(s, "alt+"); ok && len([]rune(rest)) == 1 {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(rest), Alt: true}
+	}
+	// Anything else round-trips through KeyRunes, whose String() is the runes
+	// themselves ("up", "ctrl+k", …).
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 }
 
@@ -59,10 +80,38 @@ func typeString(m model, s string) model {
 }
 
 func TestQuitKeys(t *testing.T) {
-	for _, k := range []string{"ctrl+c", "ctrl+d"} {
-		m := newTestModel()
-		_, cmd := m.Update(press(k))
-		assertQuit(t, cmd)
+	m := newTestModel()
+	_, cmd := m.Update(press("ctrl+c"))
+	assertQuit(t, cmd)
+}
+
+func TestCtrlDClosesTheTabOnAnEmptyLine(t *testing.T) {
+	// Empty line: close the tab (and never quit memhack outright).
+	m := newTestModel()
+	nm, cmd := m.Update(press("ctrl+d"))
+	m = nm.(model)
+	if cmd == nil {
+		t.Fatal("ctrl+d on an empty line should issue a close-tab command")
+	}
+	if _, isQuit := cmd().(tea.QuitMsg); isQuit {
+		t.Error("ctrl+d must not quit memhack")
+	}
+	if !m.busy {
+		t.Error("ctrl+d should mark the model busy while the close runs")
+	}
+
+	// With something typed it belongs to the input, where it deletes the
+	// character under the cursor — as in a shell.
+	m = newTestModel()
+	m = typeString(m, "1337")
+	m.input.SetCursor(0)
+	nm, _ = m.Update(press("ctrl+d"))
+	m = nm.(model)
+	if m.busy {
+		t.Error("ctrl+d with a typed line should not close the tab")
+	}
+	if got := m.input.Value(); got != "337" {
+		t.Errorf("input = %q, want %q (ctrl+d should delete forward)", got, "337")
 	}
 }
 
@@ -750,6 +799,264 @@ func TestStatusNoteSurvivesRefresh(t *testing.T) {
 	if !strings.Contains(m.status, "3 matches") {
 		t.Errorf("refresh cleared the status note: status = %q", m.status)
 	}
+}
+
+// twoTabState is a state with two open tabs, the second one active.
+func twoTabState() state {
+	return state{
+		Attached: true, Pid: 42, Type: scan.I32, Count: 1, Scanned: true,
+		Tabs: []tabInfo{
+			{Label: "1337", Type: scan.I32, Count: 3, Scanned: true},
+			{Label: "health", Type: scan.I32, Count: 1, Scanned: true},
+		},
+		Active: 1,
+		Rows:   []matchRow{{Index: 0, Addr: 0x1000, Value: "5"}},
+	}
+}
+
+func TestTabBarShowsEveryTab(t *testing.T) {
+	m := newTestModel()
+	// The bar is drawn from the start, so the feature is visible before any
+	// tab has been opened.
+	if !strings.Contains(m.View(), "1 empty") {
+		t.Error("the tab bar should show the initial tab")
+	}
+	if !strings.Contains(m.View(), "ctrl+t") {
+		t.Error("the tab bar should advertise the key that opens a tab")
+	}
+
+	nm, _ := m.Update(stateMsg(twoTabState()))
+	m = nm.(model)
+	view := m.View()
+	for _, want := range []string{"1 1337 (3)", "2 health (1)"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("tab bar is missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestTabBarFitsNarrowTerminals(t *testing.T) {
+	m := newTestModel()
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 24, Height: 20})
+	m = nm.(model)
+	st := twoTabState()
+	st.Tabs = append(st.Tabs, tabInfo{Label: "a very long tab name indeed", Count: 9, Scanned: true})
+	nm, _ = m.Update(stateMsg(st))
+	m = nm.(model)
+
+	bar := m.tabBar()
+	if w := ansi.StringWidth(bar); w > 24 {
+		t.Errorf("tab bar is %d cells wide, past the 24-cell terminal: %q", w, bar)
+	}
+	// Too narrow to list them all, so it names the current one instead.
+	if !strings.Contains(bar, "tab 2/3") {
+		t.Errorf("narrow tab bar should report which tab is current: %q", bar)
+	}
+}
+
+func TestTabKeysIssueCommands(t *testing.T) {
+	for _, key := range []string{"ctrl+t", "alt+t", "alt+w", "shift+tab", "alt+left", "alt+right", "alt+2"} {
+		m := newTestModel()
+		nm, cmd := m.Update(press(key))
+		if cmd == nil {
+			t.Errorf("%s should issue a tab command", key)
+		}
+		if !nm.(model).busy {
+			t.Errorf("%s should mark the model busy", key)
+		}
+	}
+
+	// A plain digit is a scan expression, not a tab switch.
+	m := newTestModel()
+	m = typeString(m, "2")
+	if m.input.Value() != "2" {
+		t.Errorf("a bare digit should type into the input, got %q", m.input.Value())
+	}
+}
+
+func TestSwitchingTabsLeavesWriteMode(t *testing.T) {
+	m := newTestModel()
+	nm, _ := m.Update(stateMsg(twoTabState()))
+	m = nm.(model)
+	nm, _ = m.Update(press("tab")) // focus the table
+	m = nm.(model)
+	nm, _ = m.Update(press("w")) // start a write
+	m = nm.(model)
+	if m.mode != modeWrite {
+		t.Fatal("expected write mode")
+	}
+
+	// The pending write is aimed at a match in this tab; switching must drop it
+	// rather than apply it to whatever match #0 is over there.
+	nm, _ = m.Update(press("shift+tab"))
+	m = nm.(model)
+	if m.mode != modeScan {
+		t.Error("switching tabs should leave write mode")
+	}
+}
+
+func TestRenameTabWithF2(t *testing.T) {
+	m := newTestModel()
+	st := twoTabState()
+	st.Tabs[1].Name = "health" // tab 2 has been named before
+	nm, _ := m.Update(stateMsg(st))
+	m = nm.(model)
+
+	nm, _ = m.Update(press("f2"))
+	m = nm.(model)
+	if m.mode != modeRename {
+		t.Fatal("f2 should start a rename")
+	}
+	if m.input.Value() != "health" {
+		t.Errorf("the prompt should be prefilled with the current name, got %q", m.input.Value())
+	}
+	if !strings.Contains(m.input.Prompt, "tab 2") {
+		t.Errorf("prompt = %q, want it to name the tab being renamed", m.input.Prompt)
+	}
+
+	// esc abandons it.
+	nm, _ = m.Update(press("esc"))
+	m = nm.(model)
+	if m.mode != modeScan || !strings.Contains(m.status, "rename") {
+		t.Errorf("esc should cancel the rename; mode = %v, status = %q", m.mode, m.status)
+	}
+
+	// Submitting issues the rename and returns to scanning.
+	nm, _ = m.Update(press("f2"))
+	m = nm.(model)
+	m.input.SetValue("")
+	m = typeString(m, "ammo")
+	nm, cmd := m.Update(press("enter"))
+	m = nm.(model)
+	if cmd == nil {
+		t.Fatal("submitting a name should issue a rename command")
+	}
+	if m.mode != modeScan {
+		t.Error("after renaming, the input should be back to scanning")
+	}
+	if m.input.Placeholder != scanPlaceholder {
+		t.Error("the rename placeholder should be restored to the scan one")
+	}
+
+	// An empty name is a real instruction (clear it), not a no-op repeat scan.
+	m.lastScan = "inc"
+	nm, _ = m.Update(press("f2"))
+	m = nm.(model)
+	m.input.SetValue("")
+	nm, cmd = m.Update(press("enter"))
+	m = nm.(model)
+	if cmd == nil {
+		t.Error("an empty name should still issue a rename, clearing the name")
+	}
+	if strings.Contains(m.status, "repeat") {
+		t.Error("an empty rename must not be taken as a repeat-scan")
+	}
+}
+
+func TestTabCommands(t *testing.T) {
+	for _, in := range []string{":tab", ":tab new", ":tab new health", ":tab close", ":tab rename ammo", ":tab 2"} {
+		m := newTestModel()
+		m = typeString(m, in)
+		nm, cmd := m.Update(press("enter"))
+		if cmd == nil {
+			t.Errorf("%q should issue a tab command", in)
+		}
+		if e := nm.(model).errMsg; e != "" {
+			t.Errorf("%q set an error: %s", in, e)
+		}
+	}
+	for _, in := range []string{":tab bogus", ":tab rename"} {
+		m := newTestModel()
+		m = typeString(m, in)
+		nm, cmd := m.Update(press("enter"))
+		if cmd != nil {
+			t.Errorf("%q should not issue a command", in)
+		}
+		if nm.(model).errMsg == "" {
+			t.Errorf("%q should report a usage error", in)
+		}
+	}
+}
+
+func TestActiveTabsScanIsTheOneRepeated(t *testing.T) {
+	m := newTestModel()
+	m = typeString(m, "inc")
+	nm, _ := m.Update(press("enter"))
+	m = nm.(model)
+	if m.lastScan != "inc" {
+		t.Fatalf("lastScan = %q, want inc", m.lastScan)
+	}
+
+	// The reply for a different tab carries that tab's own last scan, which is
+	// what an empty enter must now repeat.
+	st := twoTabState()
+	st.LastScan = "> 100"
+	nm, _ = m.Update(stateMsg(st))
+	m = nm.(model)
+	if m.lastScan != "> 100" {
+		t.Errorf("lastScan = %q, want the active tab's own scan", m.lastScan)
+	}
+	if !strings.Contains(m.View(), "> 100") {
+		t.Error("the help line should offer to repeat the active tab's scan")
+	}
+}
+
+func TestSwitchingTabsResetsTheSelection(t *testing.T) {
+	m := newTestModel()
+	st := twoTabState()
+	st.Rows = []matchRow{
+		{Index: 0, Addr: 0x1000, Value: "1"},
+		{Index: 1, Addr: 0x2000, Value: "2"},
+	}
+	nm, _ := m.Update(stateMsg(st))
+	m = nm.(model)
+	m.table.SetCursor(1)
+
+	// A state describing a different tab: the old selection means nothing.
+	other := st
+	other.Active = 0
+	nm, _ = m.Update(stateMsg(other))
+	m = nm.(model)
+	if m.table.Cursor() != 0 {
+		t.Errorf("cursor = %d after switching tabs, want 0", m.table.Cursor())
+	}
+}
+
+func TestHelpScreen(t *testing.T) {
+	for _, open := range []func(model) (tea.Model, tea.Cmd){
+		func(m model) (tea.Model, tea.Cmd) { return m.Update(press("f1")) },
+		func(m model) (tea.Model, tea.Cmd) {
+			m = typeString(m, ":help")
+			return m.Update(press("enter"))
+		},
+	} {
+		nm, _ := open(newTestModel())
+		m := nm.(model)
+		if m.screen != screenHelp {
+			t.Fatal("expected the help screen to open")
+		}
+		view := m.View()
+		for _, want := range []string{"ctrl+t", "alt+1", "own matches", ":tab rename"} {
+			if !strings.Contains(view, want) {
+				t.Errorf("help screen is missing %q", want)
+			}
+		}
+
+		// Scrolling stays on the screen; anything else returns to the scanner.
+		nm, _ = m.Update(press("down"))
+		if nm.(model).screen != screenHelp {
+			t.Error("scrolling should not close the help screen")
+		}
+		nm, _ = m.Update(press("esc"))
+		if nm.(model).screen != screenScanner {
+			t.Error("esc should close the help screen")
+		}
+	}
+
+	// It never swallows a quit.
+	nm, _ := newTestModel().Update(press("f1"))
+	_, cmd := nm.(model).Update(press("ctrl+c"))
+	assertQuit(t, cmd)
 }
 
 func TestTickGating(t *testing.T) {

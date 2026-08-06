@@ -32,17 +32,30 @@ type matchRow struct {
 	Frozen bool
 }
 
+// tabInfo is one open search summarised for the tab bar.
+type tabInfo struct {
+	Label   string // what to show: the name, else the last scan, else a placeholder
+	Name    string // the given name, empty if it has never been named
+	Type    scan.DataType
+	Count   int
+	Scanned bool
+}
+
 // state is a snapshot of the worker's condition, sent to the UI after every
-// request so the view can be rebuilt from it.
+// request so the view can be rebuilt from it. Everything below the Tabs/Active
+// pair describes the active tab.
 type state struct {
 	Attached bool
 	Pid      int
+	Tabs     []tabInfo
+	Active   int // index into Tabs of the tab the rest of this state describes
 	Type     scan.DataType
 	Count    int
 	Scanned  bool
 	CanUndo  bool
 	Frozen   int
 	Align    int
+	LastScan string
 	Rows     []matchRow
 	Note     string // human-readable result of the last action
 	Err      error
@@ -66,26 +79,42 @@ type job struct {
 	reply chan state
 }
 
-// worker owns the attached process and scanner. All ptrace and /proc/<pid>/mem
-// access happens on its single locked OS thread, satisfying ptrace's
-// same-thread requirement while keeping the UI goroutine free.
+// worker owns the attached process and the open searches. All ptrace and
+// /proc/<pid>/mem access happens on its single locked OS thread, satisfying
+// ptrace's same-thread requirement while keeping the UI goroutine free.
 type worker struct {
 	jobs chan job
 	proc *memory.Process
-	sc   *scan.Scanner
-	dt   scan.DataType
+
+	// tabSet holds the open searches; the active tab owns the scanner, type and
+	// alignment that every request below operates on.
+	tabSet
 
 	// frozen maps an address to the bytes that are continually rewritten there
 	// by the freeze ticker, holding its value against the target's own writes.
+	// It is shared by every tab: freezing belongs to the target's address space,
+	// so a frozen value keeps being held whichever tab is on screen.
 	frozen      map[uint64][]byte
 	freezeEvery time.Duration
-
-	// align is the scan step applied to new scanners (0 = align to type width).
-	align int
 
 	// prog carries scan progress to the UI. Sends are non-blocking, so a UI
 	// that is slow to drain never holds up a scan (and with it the target).
 	prog chan scan.Progress
+}
+
+// newWorker builds a worker with a single empty tab. freezeEvery is how often
+// frozen addresses are rewritten (<= 0 uses the default).
+func newWorker(initial scan.DataType, freezeEvery time.Duration, align int) *worker {
+	if freezeEvery <= 0 {
+		freezeEvery = defaultFreezeInterval
+	}
+	return &worker{
+		jobs:        make(chan job),
+		tabSet:      newTabSet(initial, align),
+		frozen:      map[uint64][]byte{},
+		freezeEvery: freezeEvery,
+		prog:        make(chan scan.Progress, 1),
+	}
 }
 
 // sendProgress forwards a scan progress update, dropping it if the previous one
@@ -118,20 +147,7 @@ type controller struct {
 // freezeEvery is how often frozen addresses are rewritten (<= 0 uses the
 // default).
 func newController(initial scan.DataType, freezeEvery time.Duration, align int) *controller {
-	if freezeEvery <= 0 {
-		freezeEvery = defaultFreezeInterval
-	}
-	if align < 0 {
-		align = 0
-	}
-	w := &worker{
-		jobs:        make(chan job),
-		dt:          initial,
-		frozen:      map[uint64][]byte{},
-		freezeEvery: freezeEvery,
-		align:       align,
-		prog:        make(chan scan.Progress, 1),
-	}
+	w := newWorker(initial, freezeEvery, align)
 	go w.loop()
 	return &controller{jobs: w.jobs, prog: w.prog}
 }
@@ -204,33 +220,45 @@ func (w *worker) applyFreezes() {
 	}
 }
 
-// snapshot refreshes the displayed matches and captures the current state.
+// snapshot refreshes the displayed matches and captures the current state. The
+// tab bar is summarised for every tab; everything else describes the active
+// one, which is all the UI shows at a time.
 func (w *worker) snapshot() state {
-	st := state{Type: w.dt}
+	t := w.active()
+	st := state{Type: t.dt, Active: w.cur, LastScan: t.lastScan, Frozen: len(w.frozen)}
+	st.Tabs = make([]tabInfo, 0, len(w.tabs))
+	for _, other := range w.tabs {
+		info := tabInfo{Label: other.label(), Name: other.name, Type: other.dt}
+		if other.sc != nil {
+			info.Count = len(other.sc.Matches)
+			info.Scanned = other.sc.Scanned()
+		}
+		st.Tabs = append(st.Tabs, info)
+	}
 	if w.proc != nil {
 		st.Attached = true
 		st.Pid = w.proc.Pid
 	}
-	if w.sc == nil {
+	if t.sc == nil {
 		return st
 	}
-	st.Count = len(w.sc.Matches)
-	st.Scanned = w.sc.Scanned()
-	st.CanUndo = w.sc.CanUndo()
-
-	st.Frozen = len(w.frozen)
-	st.Align = w.sc.Alignment()
+	st.Count = len(t.sc.Matches)
+	st.Scanned = t.sc.Scanned()
+	st.CanUndo = t.sc.CanUndo()
+	st.Align = t.sc.Alignment()
 
 	n := st.Count
 	if n > displayLimit {
 		n = displayLimit
 	}
-	w.sc.RefreshN(n)
+	// Only the active tab's values are re-read: background tabs cost the target
+	// nothing until you switch to them.
+	t.sc.RefreshN(n)
 	st.Rows = make([]matchRow, 0, n)
 	for i := 0; i < n; i++ {
-		m := w.sc.Matches[i]
+		m := t.sc.Matches[i]
 		_, frozen := w.frozen[m.Addr]
-		st.Rows = append(st.Rows, matchRow{Index: i, Addr: m.Addr, Value: w.dt.Format(m.Last), Frozen: frozen})
+		st.Rows = append(st.Rows, matchRow{Index: i, Addr: m.Addr, Value: t.dt.Format(m.Last), Frozen: frozen})
 	}
 	return st
 }
@@ -312,6 +340,37 @@ func (c *controller) setAlign(n int) tea.Cmd {
 	return c.submit(func(w *worker) (string, error) { return w.setAlign(n) })
 }
 
+// --- tabs ---
+//
+// Tab requests go through the worker like everything else, so they queue behind
+// a scan that is already running rather than mutating state underneath it. A
+// long scan therefore delays a tab switch until it finishes (or is cancelled
+// with esc), which is the price of never racing the scanner.
+
+func (c *controller) newTab(name string) tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.newTab(name) })
+}
+
+func (c *controller) closeTab() tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.closeTab() })
+}
+
+func (c *controller) selectTab(i int) tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.selectTab(i) })
+}
+
+func (c *controller) cycleTab(delta int) tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.cycleTab(delta) })
+}
+
+func (c *controller) renameTab(name string) tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.renameTab(name) })
+}
+
+func (c *controller) listTabs() tea.Cmd {
+	return c.submit(func(w *worker) (string, error) { return w.summary(), nil })
+}
+
 // --- worker request handlers (all run on the locked thread) ---
 
 func (w *worker) attach(pid int) (string, error) {
@@ -329,7 +388,7 @@ func (w *worker) attach(pid int) (string, error) {
 	proc.Detach()
 
 	w.proc = proc
-	w.sc = w.newScanner(proc)
+	w.bindTabs()
 	return fmt.Sprintf("attached to pid %d", pid), nil
 }
 
@@ -349,15 +408,24 @@ func (w *worker) launch(argv []string) (string, error) {
 	proc.Detach()
 
 	w.proc = proc
-	w.sc = w.newScanner(proc)
+	w.bindTabs()
 	return fmt.Sprintf("launched %s as pid %d", argv[0], proc.Pid), nil
 }
 
-// newScanner builds a scanner for proc with the worker's current settings and
-// progress reporting wired up.
-func (w *worker) newScanner(proc *memory.Process) *scan.Scanner {
-	sc := scan.NewScanner(proc, w.dt)
-	sc.Align = w.align
+// bindTabs gives every tab a fresh scanner for the newly attached process. A
+// match is an address in one process's address space and means nothing in
+// another's, so every search starts over — not just the one on screen.
+func (w *worker) bindTabs() {
+	for _, t := range w.tabs {
+		t.sc = w.newScanner(t)
+	}
+}
+
+// newScanner builds a scanner for the attached process with the tab's settings
+// and progress reporting wired up.
+func (w *worker) newScanner(t *tab) *scan.Scanner {
+	sc := scan.NewScanner(w.proc, t.dt)
+	sc.Align = t.align
 	if w.prog != nil {
 		sc.Progress = w.sendProgress
 	}
@@ -369,21 +437,80 @@ func (w *worker) detach() {
 		w.proc.Close()
 		w.proc = nil
 	}
-	w.sc = nil
+	for _, t := range w.tabs {
+		t.sc = nil
+	}
 	// Freezes belong to the previous process; drop them.
 	w.frozen = map[uint64][]byte{}
 }
 
-// freezeIndex toggles the freeze state of match #i, capturing its current
-// value when freezing.
+// newTab opens a search alongside the current one and switches to it.
+func (w *worker) newTab(name string) (string, error) {
+	t, err := w.open(name)
+	if err != nil {
+		return "", err
+	}
+	if w.proc != nil {
+		t.sc = w.newScanner(t)
+	}
+	return fmt.Sprintf("tab %d of %d — %s", w.cur+1, len(w.tabs), t.label()), nil
+}
+
+// closeTab discards the current tab along with its matches.
+func (w *worker) closeTab() (string, error) {
+	closed, err := w.closeActive()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("closed %q; now on tab %d of %d", closed.label(), w.cur+1, len(w.tabs)), nil
+}
+
+// selectTab switches to tab i (0-based).
+func (w *worker) selectTab(i int) (string, error) {
+	if err := w.selectAt(i); err != nil {
+		return "", err
+	}
+	return w.tabNote(), nil
+}
+
+// cycleTab moves delta tabs along, wrapping at both ends.
+func (w *worker) cycleTab(delta int) (string, error) {
+	if len(w.tabs) == 1 {
+		return "only one tab open (ctrl+t opens another)", nil
+	}
+	w.cycle(delta)
+	return w.tabNote(), nil
+}
+
+func (w *worker) renameTab(name string) (string, error) {
+	w.rename(name)
+	if w.active().name == "" {
+		return "tab name cleared", nil
+	}
+	return w.tabNote(), nil
+}
+
+// tabNote describes the tab now on screen, for the status line.
+func (w *worker) tabNote() string {
+	t := w.active()
+	if t.sc == nil || !t.sc.Scanned() {
+		return fmt.Sprintf("tab %d of %d — %s (unscanned)", w.cur+1, len(w.tabs), t.label())
+	}
+	return fmt.Sprintf("tab %d of %d — %s (%d matches, %s)", w.cur+1, len(w.tabs), t.label(), len(t.sc.Matches), t.dt)
+}
+
+// freezeIndex toggles the freeze state of match #i in the active tab, capturing
+// its current value when freezing. The freeze itself is process-wide: it goes
+// on holding that address whichever tab is on screen.
 func (w *worker) freezeIndex(i int) (string, error) {
-	if w.sc == nil {
+	t := w.active()
+	if t.sc == nil {
 		return "", errNotAttached
 	}
-	if i < 0 || i >= len(w.sc.Matches) {
+	if i < 0 || i >= len(t.sc.Matches) {
 		return "", fmt.Errorf("no match #%d", i)
 	}
-	m := w.sc.Matches[i]
+	m := t.sc.Matches[i]
 	if _, ok := w.frozen[m.Addr]; ok {
 		delete(w.frozen, m.Addr)
 		return fmt.Sprintf("unfroze %#x", m.Addr), nil
@@ -391,7 +518,7 @@ func (w *worker) freezeIndex(i int) (string, error) {
 	raw := make([]byte, len(m.Last))
 	copy(raw, m.Last)
 	w.frozen[m.Addr] = raw
-	return fmt.Sprintf("froze %#x = %s", m.Addr, w.dt.Format(raw)), nil
+	return fmt.Sprintf("froze %#x = %s", m.Addr, t.dt.Format(raw)), nil
 }
 
 // unfreezeAll clears every frozen address.
@@ -402,16 +529,20 @@ func (w *worker) unfreezeAll() (string, error) {
 }
 
 func (w *worker) scanExpr(ctx context.Context, expr string) (string, error) {
-	if w.sc == nil {
+	t := w.active()
+	if t.sc == nil {
 		return "", errNotAttached
 	}
-	cond, err := parseScan(expr, w.dt)
+	cond, err := parseScan(expr, t.dt)
 	if err != nil {
 		return "", err
 	}
-	first := !w.sc.Scanned()
-	before := len(w.sc.Matches)
-	if err := w.sc.ScanContext(ctx, cond); err != nil {
+	// Remembered per tab: an empty enter repeats this tab's own last scan, and
+	// an unnamed tab is labelled by it.
+	t.lastScan = expr
+	first := !t.sc.Scanned()
+	before := len(t.sc.Matches)
+	if err := t.sc.ScanContext(ctx, cond); err != nil {
 		if errors.Is(err, scan.ErrCancelled) {
 			// Report as a note, not an error; the match set is unchanged.
 			return "scan cancelled", nil
@@ -419,40 +550,42 @@ func (w *worker) scanExpr(ctx context.Context, expr string) (string, error) {
 		return "", err
 	}
 	if first {
-		return fmt.Sprintf("%d matches", len(w.sc.Matches)), nil
+		return fmt.Sprintf("%d matches", len(t.sc.Matches)), nil
 	}
-	return fmt.Sprintf("%d matches (was %d)", len(w.sc.Matches), before), nil
+	return fmt.Sprintf("%d matches (was %d)", len(t.sc.Matches), before), nil
 }
 
 func (w *worker) write(index int, value string) (string, error) {
-	if w.sc == nil {
+	t := w.active()
+	if t.sc == nil {
 		return "", errNotAttached
 	}
-	if index < 0 || index >= len(w.sc.Matches) {
+	if index < 0 || index >= len(t.sc.Matches) {
 		return "", fmt.Errorf("no match #%d", index)
 	}
-	raw, err := w.dt.Encode(value)
+	raw, err := t.dt.Encode(value)
 	if err != nil {
 		return "", err
 	}
-	m := w.sc.Matches[index]
-	if err := w.sc.Write(m, raw); err != nil {
+	m := t.sc.Matches[index]
+	if err := t.sc.Write(m, raw); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("wrote %s to %#x", value, m.Addr), nil
 }
 
 func (w *worker) writeAll(value string) (string, error) {
-	if w.sc == nil {
+	t := w.active()
+	if t.sc == nil {
 		return "", errNotAttached
 	}
-	raw, err := w.dt.Encode(value)
+	raw, err := t.dt.Encode(value)
 	if err != nil {
 		return "", err
 	}
 	ok, fail := 0, 0
-	for _, m := range w.sc.Matches {
-		if err := w.sc.Write(m, raw); err != nil {
+	for _, m := range t.sc.Matches {
+		if err := t.sc.Write(m, raw); err != nil {
 			fail++
 		} else {
 			ok++
@@ -462,45 +595,51 @@ func (w *worker) writeAll(value string) (string, error) {
 }
 
 func (w *worker) undo() (string, error) {
-	if w.sc == nil {
+	t := w.active()
+	if t.sc == nil {
 		return "", errNotAttached
 	}
-	if !w.sc.Undo() {
+	if !t.sc.Undo() {
 		return "nothing to undo", nil
 	}
 	return "undo: restored previous matches", nil
 }
 
 func (w *worker) reset() (string, error) {
-	if w.sc == nil {
+	t := w.active()
+	if t.sc == nil {
 		return "", errNotAttached
 	}
-	w.sc.Reset()
+	t.sc.Reset()
 	return "matches reset", nil
 }
 
+// setType changes the active tab's data type, resetting that tab's matches.
+// Other tabs keep their own type and matches.
 func (w *worker) setType(name string) (string, error) {
 	dt, err := scan.ParseDataType(name)
 	if err != nil {
 		return "", err
 	}
-	w.dt = dt
-	if w.sc != nil {
-		w.sc.SetType(dt)
-		w.sc.Align = w.align
+	t := w.active()
+	t.dt = dt
+	if t.sc != nil {
+		t.sc.SetType(dt)
+		t.sc.Align = t.align
 	}
 	return fmt.Sprintf("type = %s (matches reset)", dt), nil
 }
 
-// setAlign sets the scan step. n <= 0 means align to the type width; it takes
-// effect on the next initial scan.
+// setAlign sets the active tab's scan step. n <= 0 means align to the type
+// width; it takes effect on the next initial scan.
 func (w *worker) setAlign(n int) (string, error) {
 	if n < 0 {
 		n = 0
 	}
-	w.align = n
-	if w.sc != nil {
-		w.sc.Align = n
+	t := w.active()
+	t.align = n
+	if t.sc != nil {
+		t.sc.Align = n
 	}
 	if n == 0 {
 		return "alignment: type width (fast)", nil

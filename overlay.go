@@ -16,6 +16,14 @@ func padBetween(left, right string, w int) string {
 	return left + strings.Repeat(" ", gap) + right
 }
 
+// padRight pads s out to w cells so a column of labels lines up.
+func padRight(s string, w int) string {
+	if pad := w - ansi.StringWidth(s); pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s + " "
+}
+
 // placeOverlayCenter composites box over the centre of base and returns the
 // result with base's dimensions unchanged: each covered line is cut around the
 // box so it appears to float above the content underneath rather than pushing

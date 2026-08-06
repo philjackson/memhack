@@ -56,7 +56,7 @@ func main() {
 func runREPL(dt scan.DataType, pid int, exec string, args []string, align int) {
 	runtime.LockOSThread()
 
-	app := &app{dtype: dt, align: align}
+	app := &app{tabSet: newTabSet(dt, align)}
 	switch {
 	case exec != "":
 		if err := app.launch(append([]string{exec}, args...)); err != nil {
@@ -94,12 +94,18 @@ func runTUI(dt scan.DataType, pid int, exec string, args []string, watch, freeze
 	return err
 }
 
+// app is the REPL's state: the attached process and the open searches (see
+// tabs.go). Like the TUI, each tab keeps its own matches, type, and alignment.
 type app struct {
-	proc    *memory.Process
-	scanner *scan.Scanner
-	dtype   scan.DataType
-	align   int
+	proc *memory.Process
+	tabSet
 }
+
+// scanner is the active tab's scanner, or nil when nothing is attached.
+func (a *app) scanner() *scan.Scanner { return a.active().sc }
+
+// dtype is the active tab's data type.
+func (a *app) dtype() scan.DataType { return a.active().dt }
 
 func (a *app) attach(pid int) error {
 	if a.proc != nil {
@@ -110,9 +116,8 @@ func (a *app) attach(pid int) error {
 		return err
 	}
 	a.proc = proc
-	a.scanner = scan.NewScanner(proc, a.dtype)
-	a.scanner.Align = a.align
-	fmt.Printf("attached to pid %d (type=%s)\n", pid, a.dtype)
+	a.bindTabs()
+	fmt.Printf("attached to pid %d (type=%s)\n", pid, a.dtype())
 	return nil
 }
 
@@ -128,10 +133,18 @@ func (a *app) launch(argv []string) error {
 		return err
 	}
 	a.proc = proc
-	a.scanner = scan.NewScanner(proc, a.dtype)
-	a.scanner.Align = a.align
-	fmt.Printf("launched %s as pid %d (type=%s)\n", argv[0], proc.Pid, a.dtype)
+	a.bindTabs()
+	fmt.Printf("launched %s as pid %d (type=%s)\n", argv[0], proc.Pid, a.dtype())
 	return nil
+}
+
+// bindTabs gives every tab a fresh scanner for the newly attached process:
+// matches from another process's address space mean nothing here.
+func (a *app) bindTabs() {
+	for _, t := range a.tabs {
+		t.sc = scan.NewScanner(a.proc, t.dt)
+		t.sc.Align = t.align
+	}
 }
 
 func (a *app) repl() {
@@ -152,11 +165,18 @@ func (a *app) repl() {
 	}
 }
 
+// prompt shows the match count, and which tab is current once more than one is
+// open (or the current one has been named).
 func (a *app) prompt() string {
-	if a.scanner == nil {
-		return "memhack> "
+	t := a.active()
+	label := ""
+	if len(a.tabs) > 1 || t.name != "" {
+		label = fmt.Sprintf("(%d %s)", a.cur+1, t.label())
 	}
-	return fmt.Sprintf("memhack[%d]> ", len(a.scanner.Matches))
+	if t.sc == nil {
+		return "memhack" + label + "> "
+	}
+	return fmt.Sprintf("memhack%s[%d]> ", label, len(t.sc.Matches))
 }
 
 // dispatch runs one command line. It returns true if the REPL should exit.
@@ -182,6 +202,8 @@ func (a *app) dispatch(line string) bool {
 		a.cmdType(args)
 	case "align":
 		a.cmdAlign(args)
+	case "tab", "tabs":
+		a.cmdTab(args)
 	case "regions", "maps":
 		a.cmdRegions()
 	case "list", "ls":
@@ -219,9 +241,11 @@ func (a *app) cmdAttach(args []string) {
 	}
 }
 
+// cmdType shows or sets the active tab's data type; other tabs keep theirs.
 func (a *app) cmdType(args []string) {
+	t := a.active()
 	if len(args) != 1 {
-		fmt.Printf("current type: %s\n", a.dtype)
+		fmt.Printf("current type: %s\n", t.dt)
 		return
 	}
 	dt, err := scan.ParseDataType(args[0])
@@ -229,21 +253,22 @@ func (a *app) cmdType(args []string) {
 		fmt.Println("error:", err)
 		return
 	}
-	a.dtype = dt
-	if a.scanner != nil {
-		a.scanner.SetType(dt)
-		a.scanner.Align = a.align
+	t.dt = dt
+	if t.sc != nil {
+		t.sc.SetType(dt)
+		t.sc.Align = t.align
 		fmt.Println("type set; matches reset")
 	}
 	fmt.Printf("type = %s\n", dt)
 }
 
 func (a *app) cmdAlign(args []string) {
+	t := a.active()
 	if len(args) != 1 {
-		if a.scanner != nil {
-			fmt.Printf("alignment: %d byte(s)\n", a.scanner.Alignment())
+		if t.sc != nil {
+			fmt.Printf("alignment: %d byte(s)\n", t.sc.Alignment())
 		} else {
-			fmt.Printf("alignment setting: %d (0 = type width)\n", a.align)
+			fmt.Printf("alignment setting: %d (0 = type width)\n", t.align)
 		}
 		return
 	}
@@ -252,11 +277,52 @@ func (a *app) cmdAlign(args []string) {
 		fmt.Println("error:", err)
 		return
 	}
-	a.align = n
-	if a.scanner != nil {
-		a.scanner.Align = n
+	t.align = n
+	if t.sc != nil {
+		t.sc.Align = n
 	}
 	fmt.Printf("alignment set to %d (0 = type width; applies to the next scan)\n", n)
+}
+
+// cmdTab manages the open searches: see tabUsage for the forms it accepts.
+func (a *app) cmdTab(args []string) {
+	cmd, err := parseTabCmd(args)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	switch cmd.action {
+	case tabList:
+		fmt.Println(a.summary())
+		fmt.Println(tabUsage)
+	case tabNew:
+		t, err := a.open(cmd.name)
+		if err != nil {
+			fmt.Println("error:", err)
+			return
+		}
+		if a.proc != nil {
+			t.sc = scan.NewScanner(a.proc, t.dt)
+			t.sc.Align = t.align
+		}
+		fmt.Printf("opened tab %d of %d (type=%s)\n", a.cur+1, len(a.tabs), t.dt)
+	case tabClose:
+		closed, err := a.closeActive()
+		if err != nil {
+			fmt.Println("error:", err)
+			return
+		}
+		fmt.Printf("closed %q; now on tab %d of %d\n", closed.label(), a.cur+1, len(a.tabs))
+	case tabRename:
+		a.rename(cmd.name)
+		fmt.Printf("tab %d renamed to %s\n", a.cur+1, cmd.name)
+	case tabSelect:
+		if err := a.selectAt(cmd.index); err != nil {
+			fmt.Println("error:", err)
+			return
+		}
+		fmt.Printf("tab %d of %d — %s (type=%s)\n", a.cur+1, len(a.tabs), a.active().label(), a.dtype())
+	}
 }
 
 // parseAlign parses an alignment argument: "type"/"auto"/"0" = align to the
@@ -299,33 +365,33 @@ func (a *app) cmdRegions() {
 }
 
 func (a *app) cmdCount() {
-	if a.scanner == nil {
+	if a.scanner() == nil {
 		fmt.Println("not attached")
 		return
 	}
-	fmt.Printf("%d matches\n", len(a.scanner.Matches))
+	fmt.Printf("%d matches\n", len(a.scanner().Matches))
 }
 
 func (a *app) cmdReset() {
-	if a.scanner == nil {
+	if a.scanner() == nil {
 		fmt.Println("not attached")
 		return
 	}
-	a.scanner.Reset()
+	a.scanner().Reset()
 	fmt.Println("matches reset")
 }
 
 func (a *app) cmdUndo() {
-	if a.scanner == nil {
+	if a.scanner() == nil {
 		fmt.Println("not attached")
 		return
 	}
-	if !a.scanner.Undo() {
+	if !a.scanner().Undo() {
 		fmt.Println("nothing to undo")
 		return
 	}
-	if a.scanner.Scanned() {
-		fmt.Printf("undone; back to %d matches\n", len(a.scanner.Matches))
+	if a.scanner().Scanned() {
+		fmt.Printf("undone; back to %d matches\n", len(a.scanner().Matches))
 	} else {
 		fmt.Println("undone; back to the pre-scan state")
 	}
@@ -334,7 +400,7 @@ func (a *app) cmdUndo() {
 const listCap = 50
 
 func (a *app) cmdList(args []string) {
-	if a.scanner == nil {
+	if a.scanner() == nil {
 		fmt.Println("not attached")
 		return
 	}
@@ -344,8 +410,8 @@ func (a *app) cmdList(args []string) {
 			limit = v
 		}
 	}
-	a.scanner.Refresh()
-	matches := a.scanner.Matches
+	a.scanner().Refresh()
+	matches := a.scanner().Matches
 	for i, m := range matches {
 		if i >= limit {
 			fmt.Printf("... %d more (raise the limit with 'list <n>')\n", len(matches)-limit)
@@ -360,18 +426,18 @@ func (a *app) cmdList(args []string) {
 
 // formatMatch renders one match line: its index, address, and current value.
 func (a *app) formatMatch(i int, m scan.Match) string {
-	return fmt.Sprintf("[%d] %#012x = %s", i, m.Addr, a.dtype.Format(m.Last))
+	return fmt.Sprintf("[%d] %#012x = %s", i, m.Addr, a.dtype().Format(m.Last))
 }
 
 // cmdWatch continuously re-reads and displays the current matched values until
 // the user presses Ctrl-C. On a terminal it redraws in place; otherwise it
 // prints a fresh block each interval so piped output stays readable.
 func (a *app) cmdWatch(args []string) {
-	if a.scanner == nil {
+	if a.scanner() == nil {
 		fmt.Println("not attached")
 		return
 	}
-	if len(a.scanner.Matches) == 0 {
+	if len(a.scanner().Matches) == 0 {
 		fmt.Println("no matches to watch")
 		return
 	}
@@ -390,10 +456,10 @@ func (a *app) cmdWatch(args []string) {
 		interval = minInterval
 	}
 
-	n := len(a.scanner.Matches)
+	n := len(a.scanner().Matches)
 	if n > listCap {
 		n = listCap
-		fmt.Printf("(watching the first %d of %d matches)\n", n, len(a.scanner.Matches))
+		fmt.Printf("(watching the first %d of %d matches)\n", n, len(a.scanner().Matches))
 	}
 	tty := isTerminal(os.Stdout)
 
@@ -429,8 +495,8 @@ func (a *app) cmdWatch(args []string) {
 
 // drawWatch refreshes the current values and prints the first n matches.
 func (a *app) drawWatch(n int, tty bool) {
-	a.scanner.Refresh()
-	matches := a.scanner.Matches
+	a.scanner().Refresh()
+	matches := a.scanner().Matches
 	for i := 0; i < n && i < len(matches); i++ {
 		line := a.formatMatch(i, matches[i])
 		if tty {
@@ -460,7 +526,7 @@ func isTerminal(f *os.File) bool {
 }
 
 func (a *app) cmdSet(args []string) {
-	if a.scanner == nil {
+	if a.scanner() == nil {
 		fmt.Println("not attached")
 		return
 	}
@@ -469,17 +535,17 @@ func (a *app) cmdSet(args []string) {
 		return
 	}
 	idx, err := strconv.Atoi(args[0])
-	if err != nil || idx < 0 || idx >= len(a.scanner.Matches) {
+	if err != nil || idx < 0 || idx >= len(a.scanner().Matches) {
 		fmt.Println("invalid match index:", args[0])
 		return
 	}
-	raw, err := a.dtype.Encode(args[1])
+	raw, err := a.dtype().Encode(args[1])
 	if err != nil {
 		fmt.Println("error:", err)
 		return
 	}
-	m := a.scanner.Matches[idx]
-	if err := a.scanner.Write(m, raw); err != nil {
+	m := a.scanner().Matches[idx]
+	if err := a.scanner().Write(m, raw); err != nil {
 		fmt.Println("write failed:", err)
 		return
 	}
@@ -487,7 +553,7 @@ func (a *app) cmdSet(args []string) {
 }
 
 func (a *app) cmdSetAll(args []string) {
-	if a.scanner == nil {
+	if a.scanner() == nil {
 		fmt.Println("not attached")
 		return
 	}
@@ -495,14 +561,14 @@ func (a *app) cmdSetAll(args []string) {
 		fmt.Println("usage: setall <value>")
 		return
 	}
-	raw, err := a.dtype.Encode(args[0])
+	raw, err := a.dtype().Encode(args[0])
 	if err != nil {
 		fmt.Println("error:", err)
 		return
 	}
 	ok, fail := 0, 0
-	for _, m := range a.scanner.Matches {
-		if err := a.scanner.Write(m, raw); err != nil {
+	for _, m := range a.scanner().Matches {
+		if err := a.scanner().Write(m, raw); err != nil {
 			fail++
 		} else {
 			ok++
@@ -513,23 +579,25 @@ func (a *app) cmdSetAll(args []string) {
 
 // cmdScan parses a scan expression and runs it. See parseScan for the grammar.
 func (a *app) cmdScan(line string) {
-	if a.scanner == nil {
+	if a.scanner() == nil {
 		fmt.Println("not attached; use 'pid <pid>' first")
 		return
 	}
 
-	cond, err := parseScan(line, a.dtype)
+	cond, err := parseScan(line, a.dtype())
 	if err != nil {
 		fmt.Println("error:", err)
 		return
 	}
-	firstScan := !a.scanner.Scanned()
-	before := len(a.scanner.Matches)
-	if err := a.scanner.Scan(cond); err != nil {
+	// Remembered per tab, so an unnamed tab is labelled by its own last scan.
+	a.active().lastScan = line
+	firstScan := !a.scanner().Scanned()
+	before := len(a.scanner().Matches)
+	if err := a.scanner().Scan(cond); err != nil {
 		fmt.Println("error:", err)
 		return
 	}
-	after := len(a.scanner.Matches)
+	after := len(a.scanner().Matches)
 	if firstScan {
 		fmt.Printf("%d matches\n", after)
 	} else {
@@ -686,6 +754,15 @@ func printHelp() {
   type [t]           show or set data type (i8..u64, f32/f64, bytes, string)
   align [n]          show/set scan alignment (0=type width, 1=every byte)
   regions            list scannable memory regions of the target
+
+  tab                list the open searches (tabs)
+  tab new [name]     open another search; it inherits the current type/alignment
+  tab <n>            switch to tab <n>
+  tab close          close the current tab, discarding its matches
+  tab rename <name>  name the current tab
+                     Each tab keeps its own matches, undo history, type and
+                     alignment; all tabs share the target and its frozen
+                     addresses. Attaching to a process clears every tab.
 
   <value>            scan: keep locations equal to <value> (e.g. 1337, -5)
   > < >= <= != <v>   scan: keep locations comparing that way to <v>

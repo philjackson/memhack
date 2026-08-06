@@ -143,7 +143,7 @@ func TestParseScanErrors(t *testing.T) {
 }
 
 func TestFormatMatch(t *testing.T) {
-	a := &app{dtype: scan.I32}
+	a := &app{tabSet: newTabSet(scan.I32, 0)}
 	raw, _ := scan.I32.Encode("1337")
 	got := a.formatMatch(2, scan.Match{Addr: 0x55c8e8e22030, Last: raw})
 	want := "[2] 0x55c8e8e22030 = 1337"
@@ -152,7 +152,7 @@ func TestFormatMatch(t *testing.T) {
 	}
 
 	// A different type must reinterpret the same bytes.
-	af := &app{dtype: scan.F32}
+	af := &app{tabSet: newTabSet(scan.F32, 0)}
 	fraw, _ := scan.F32.Encode("1.5")
 	if got := af.formatMatch(0, scan.Match{Addr: 0x1000, Last: fraw}); got != "[0] 0x000000001000 = 1.5" {
 		t.Errorf("float formatMatch = %q", got)

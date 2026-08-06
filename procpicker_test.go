@@ -77,10 +77,20 @@ func TestPendingAttachFailureStaysOnPicker(t *testing.T) {
 }
 
 func TestPickerQuitKeys(t *testing.T) {
-	for _, k := range []string{"ctrl+c", "ctrl+d", "q"} {
+	for _, k := range []string{"ctrl+c", "q"} {
 		m := newPickerModel(t)
 		_, cmd := m.Update(press(k))
 		assertQuit(t, cmd)
+	}
+
+	// ctrl+d closes a tab elsewhere, so it must not quit from here either:
+	// the picker can be reopened mid-session with tabs full of matches.
+	m := newPickerModel(t)
+	_, cmd := m.Update(press("ctrl+d"))
+	if cmd != nil {
+		if _, isQuit := cmd().(tea.QuitMsg); isQuit {
+			t.Error("ctrl+d must not quit from the picker")
+		}
 	}
 }
 
